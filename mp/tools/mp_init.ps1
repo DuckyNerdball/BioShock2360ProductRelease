@@ -36,6 +36,11 @@ if (-not (Test-Path $Game)) {
     Write-Host "junction game_bs2 -> $Sp\game_bs2"
 }
 $Xex = Join-Path $Game "Bioshock2MP_Xenon.xex"
+# The game probes FlashMovies\int\SharedLibrary.swf (localized) before the base copy on every menu open (330+ failed
+# opens per session, part of the menu hitches). Give it the copy it asks for (your own disc file, local only).
+$Fm = Join-Path $Game "multiplayer\FlashMovies"
+if ((Test-Path "$Fm\SharedLibrary.swf") -and -not (Test-Path "$Fm\int\SharedLibrary.swf")) {
+    New-Item -ItemType Directory "$Fm\int" -Force | Out-Null; Copy-Item "$Fm\SharedLibrary.swf" "$Fm\int\SharedLibrary.swf" }
 if (-not (Test-Path $Xex)) { throw "MP XEX not found: $Xex" }
 
 # 2. rexglue init (once)

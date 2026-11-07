@@ -345,11 +345,9 @@ void OnCall(PPCContext& ctx, uint8_t* base, uint32_t fnaddr, const Fn& fn, uint3
   PPCContext keep = ctx;
   std::lock_guard<std::recursive_mutex> lk(g_mu);
   if (fn.name == "Destroyed" || fn.name == "PreLevelLoad") { g_known.erase(self); if (fn.name == "PreLevelLoad") { g_known.clear(); g_starts.clear(); g_recent_spawns.clear(); } }
-  if (kind == 'E' && fn.name == "PostBeginPlay" && Readable(self + 0x1FC, 0x14) && g_starts.size() < 256 &&
-      Has(ClassName(ctx, base, self), "PlayerStart")) {
-    StartPt p{BEF(base, self + 0x1FC), BEF(base, self + 0x200), BEF(base, self + 0x204), BE32(base, self + 0x20C)};
-    if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) g_starts.push_back(p);
-  }
+  // (11-07) Spawn points are no longer taken from every PlayerStart: some of the 131 on a map sit in streamed zones
+  // that are not loaded / team-only CapturePlayerStarts; a bot placed there crashed the game (Havok list read garbage,
+  // 3 crashes adding bots). Now only spots the game itself handed out (ModifyPlayerPosition originals) are reused.
   if (kind == 'E' && fn.name == "ModifyPlayerPosition" && parms && Readable(parms, 0x1C)) {
     uint32_t c = BE32(base, parms);
     t_mpp_bot = (c && LooksLikeUObject(base, c) && Has(ClassName(ctx, base, c), "BotController")) ? c : 0;
@@ -462,6 +460,8 @@ void ExecConsole(PPCContext& ctx, uint8_t* base, const std::string& cmd) {
   REXLOG_INFO("mp: exec '{}' (viewport {:08X}, Exec {:08X})", cmd, vp, fn);   // logged before the call: a crash names it
   if (g_spawn) { fprintf(g_spawn, "%9.3f  EXEC %s\n", Now(), cmd.c_str()); std::fflush(g_spawn); }
   PPCContext saved = ctx;
+  // Stack scratch below r1 (worked for hours from the top-level poll; the 11-07 system-heap variant coincided with
+  // GMalloc->Free crashes, so it is gone).
   uint32_t sp = (ctx.r1.u32 - 0x4000) & ~0xFu, str = sp + 0x2000;
   size_t n = std::min<size_t>(cmd.size(), 0x7FF);
   for (size_t i = 0; i < n; ++i) { base[str + 2 * i] = 0; base[str + 2 * i + 1] = uint8_t(cmd[i]); }
@@ -492,7 +492,7 @@ std::vector<std::string> ReadLines(const std::filesystem::path& p) {
 //   preyoff=0    hex offset in ShockMPBotController to force   preyforce=0   1 = write YOUR pawn there, 2 = your controller
 struct BotCfg { int enabled = 1, count = 3, preyscan = 1, preyforce = 0, aimfix = 1, countdown = 0, botdamage = 1, research = 1; double delay = 4, gap = 0.75, aimerror = 3.0, aimz = 20, aimmiss = 10, aimeye = 0;
                 uint32_t preyoff = 0; std::string cmd = "admin DebugAddAIBot"; std::vector<uint32_t> aimoffs{0x494, 0x4B0, 0x5A0, 0xA58};
-                int hunters = 0, spread = 1; double spreadmin = 600, huntnear = 1200, huntfar = 3000; std::vector<std::string> names; std::vector<uint32_t> huntoffs{0x494, 0x4B0, 0x5A0, 0xA58};
+                int hunters = 0, spread = 1, unlockall = 0, skipintro = 0; double spreadmin = 600, huntnear = 1200, huntfar = 3000; std::vector<std::string> names; std::vector<uint32_t> huntoffs{0x494, 0x4B0, 0x5A0, 0xA58};
                 std::vector<std::string> stackfns; };
 BotCfg g_cfg;
 double g_cfg_read = -10;
@@ -523,6 +523,8 @@ void ReadBotCfg() {
     else if (k == "aimz") c.aimz = std::atof(v.c_str());
     else if (k == "aimmiss") c.aimmiss = std::atof(v.c_str());
     else if (k == "spread") c.spread = std::atoi(v.c_str());
+    else if (k == "unlockall") c.unlockall = std::atoi(v.c_str());
+    else if (k == "skipintro") c.skipintro = std::atoi(v.c_str());
     else if (k == "huntnear") c.huntnear = std::atof(v.c_str());
     else if (k == "huntfar") c.huntfar = std::atof(v.c_str());
     else if (k == "names") { size_t i = 0; while (i < v.size()) { size_t j = v.find(',', i); if (j == std::string::npos) j = v.size();
@@ -655,12 +657,25 @@ void RenameBot(PPCContext& ctx, uint8_t* base, uint32_t ctrl) {
   g_renamed.insert(ctrl);
   const std::string& nm = g_cfg.names[size_t(g_name_seq++) % g_cfg.names.size()];
   PPCContext saved = ctx;
-  uint32_t sp = (ctx.r1.u32 - 0x4000) & ~0xFu, fs = sp + 0x2000, str = fs + 0x10;
+  // Source FString (12-byte header + UTF-16BE chars) lives in ONE block from the game's own allocator - no guest stack
+  // below r1 (deep inside Possess) and no system-heap memory near the game. sub_8249E720 copies (Num, realloc, memcpy),
+  // so the block is ours and leaks ~40 bytes per bot (7 per match). GMalloc = *(0x82F133EC), Malloc = vtable+8.
+  uint32_t gm = BE32(base, 0x82F133EC), str = 0;
+  if (gm && Readable(gm, 4)) {
+    uint32_t vt = BE32(base, gm), mfn = Readable(vt + 8, 4) ? BE32(base, vt + 8) : 0;
+    if (mfn >= 0x821E0000 && mfn < 0x82CA2000) {
+      ctx.r3.u64 = gm; ctx.r4.u64 = 16 + (nm.size() + 1) * 2; ctx.r5.u64 = 8;
+      REX_CALL_INDIRECT_FUNC(mfn);
+      str = ctx.r3.u32;
+    }
+  }
+  if (!str || !Readable(str, 16 + uint32_t(nm.size() + 1) * 2)) { ctx = saved; g_renamed.erase(ctrl); return; }
+  uint32_t fs = str; str += 16;
   uint32_t n = uint32_t(nm.size());
   for (uint32_t i = 0; i < n; ++i) { base[str + 2 * i] = 0; base[str + 2 * i + 1] = uint8_t(nm[i]); }
   base[str + 2 * n] = 0; base[str + 2 * n + 1] = 0;
   W32(base, fs, str); W32(base, fs + 4, n + 1); W32(base, fs + 8, n + 1);
-  ctx.r1.u64 = sp; ctx.r3.u64 = pri + kPRIName; ctx.r4.u64 = fs;
+  ctx.r3.u64 = pri + kPRIName; ctx.r4.u64 = fs;
   REX_CALL_INDIRECT_FUNC(kFStringAssign);
   ctx = saved;
   if (g_spawn) fprintf(g_spawn, "%9.3f  BOTNAME %08X '%s' -> '%s'\n", Now(), ctrl, cur.c_str(), nm.c_str());
@@ -844,8 +859,14 @@ void SpreadBotSpawn(uint8_t* base, uint32_t parms) {
     sc.push_back({best, i});
   }
   std::sort(sc.begin(), sc.end(), [](auto& a, auto& b) { return a.first > b.first; });
+  // Never put a bot on top of someone: 11-07 a bot landed 14 units from you (only 2 learned spots, both taken) and a
+  // physics worker crashed a moment later. No spot clear by 300+ units -> keep the game's own choice.
+  if (sc.empty() || sc.front().first < 300.0) {
+    if (g_spawn) fprintf(g_spawn, "%9.3f  BOTSPAWN %08X kept game spot (best free spot only %.0f away, %zu starts)\n", t, BE32(base, parms), sc.empty() ? 0.0 : sc.front().first, g_starts.size());
+    return;
+  }
   size_t pool = std::min<size_t>(3, sc.size());
-  while (pool > 1 && sc[pool - 1].first < g_cfg.spreadmin) --pool;
+  while (pool > 1 && sc[pool - 1].first < std::max(300.0, g_cfg.spreadmin)) --pool;
   const StartPt& s = g_starts[sc[size_t(Rand01() * pool) % pool].second];
   float ox = BEF(base, parms + 4), oy = BEF(base, parms + 8), oz = BEF(base, parms + 12);
   auto wf = [&](uint32_t a, float f) { uint32_t w; std::memcpy(&w, &f, 4); W32(base, a, w); };
@@ -900,6 +921,49 @@ extern "C" REX_FUNC(sub_827275D0) {
   __imp__sub_827275D0(ctx, base);
   if (realvt && Readable(pawn, 4) && BE32(base, pawn) == g_fake_vt[realvt]) W32(base, pawn, realvt);
 }
+// Zero UserProfile's rank table (TArray at +0x194: 41 ascending ints 0..97000) -> CalculateRank gives max rank.
+// The MP profile lives in Xbox LIVE user storage (XLIVEBASE 0x5000x), which the offline SDK does not persist, so every
+// launch starts from a fresh profile: do it as soon as the profile object shows up, before the session-start
+// GameEndEnsureRankUp -> CalculateRank, so you are rank 40 from the first screen.
+// ---- profile storage probe (11-07): the MP profile is Xbox LIVE user storage, never persisted offline. Log the parms of
+// the storage events (pre + post) and any TArray they carry, to build a save-to-disk / load-from-disk shim.
+bool IsStorageEvent(const std::string& n) {
+  return n == "OnReadUserStorageFileComplete" || n == "OnWriteUserStorageFileComplete" || n == "ConstructSaveDataBuffer";
+}
+void StorageProbe(uint8_t* base, const char* when, const std::string& fn, uint32_t self, uint32_t parms) {
+  static int s_n = 0;
+  if (!g_spawn || s_n++ > 40 || !parms || !Readable(parms, 0x40)) return;
+  std::string w;
+  for (uint32_t i = 0; i < 0x40; i += 4) { char b[12]; snprintf(b, sizeof b, " %08X", BE32(base, parms + i)); w += b; }
+  fprintf(g_spawn, "%9.3f  STORAGE %s %s self %08X parms%s\n", Now(), when, fn.c_str(), self, w.c_str());
+  for (uint32_t i = 0; i + 12 <= 0x40; i += 4) {
+    uint32_t d = BE32(base, parms + i), n = BE32(base, parms + i + 4), mx = BE32(base, parms + i + 8);
+    if (n < 8 || n > 0x100000 || mx < n || !Readable(d, std::min<uint32_t>(n, 64))) continue;
+    std::string h;
+    for (uint32_t k = 0; k < std::min<uint32_t>(n, 48); ++k) { char b[4]; snprintf(b, sizeof b, "%02X", base[d + k]); h += b; }
+    fprintf(g_spawn, "%9.3f  STORAGE   array @parms+%02X data %08X num %u max %u: %s\n", Now(), i, d, n, mx, h.c_str());
+  }
+  std::fflush(g_spawn);
+}
+bool ZeroRankTable(uint8_t* base, uint32_t prof) {
+  if (!Readable(prof, 0x200)) return false;
+  for (uint32_t o = 0x28; o + 12 <= 0x1000; o += 4) {
+    if (!Readable(prof + o, 12)) break;
+    uint32_t d = BE32(base, prof + o), n = BE32(base, prof + o + 4), mx = BE32(base, prof + o + 8);
+    if (n < 20 || n > 80 || mx < n || mx > 256 || !Readable(d, n * 4)) continue;
+    uint32_t last = BE32(base, d + (n - 1) * 4);
+    if (last < 10000 || last > 10000000) continue;
+    bool asc = true;
+    for (uint32_t k = 1; k < n; ++k) if (BE32(base, d + k * 4) < BE32(base, d + (k - 1) * 4)) { asc = false; break; }
+    if (!asc) continue;
+    for (uint32_t k = 0; k < n; ++k) W32(base, d + k * 4, 0);
+    // The front-end menus read the stored rank (profile+0x40; seen going 1 -> 40 at a match end) without recomputing.
+    if (Readable(prof + 0x40, 4) && BE32(base, prof + 0x40) < n - 1) W32(base, prof + 0x40, n - 1);
+    if (g_spawn) fprintf(g_spawn, "%9.3f  UNLOCKALL rank table at profile %08X +%03X: %u entries (.. %u) -> zeroed\n", Now(), prof, o, n, last);
+    return true;
+  }
+  return false;
+}
 extern "C" REX_FUNC(sub_828209B0) {   // ProcessEvent(this r3, UFunction* r4, Parms r5)
   g_base = base;
   if (!ctx.r4.u32) {   // a native raised an event that does not exist on this object (e.g. bot controller has no ServerOnHit)
@@ -911,12 +975,69 @@ extern "C" REX_FUNC(sub_828209B0) {   // ProcessEvent(this r3, UFunction* r4, Pa
   uint32_t self = ctx.r3.u32, fn = ctx.r4.u32, parms = ctx.r5.u32;
   if (n > kWarmup) {
     PPCContext keep = ctx;
-    if (const Fn* f = Learn(ctx, base, fn)) OnCall(ctx, base, fn, *f, self, parms, 0, 'E');
+    if (const Fn* f = Learn(ctx, base, fn)) { if (IsStorageEvent(f->name)) StorageProbe(base, "pre ", f->full, self, parms); OnCall(ctx, base, fn, *f, self, parms, 0, 'E'); }
     if (t_depth == 0) PollCommands(ctx, base);   // console commands only from a top-level event (game thread, not mid-script)
     ctx = keep;
   }
   ++t_depth; __imp__sub_828209B0(ctx, base); --t_depth;
+  if (n > kWarmup && parms && Readable(parms, 0x1C)) {   // learn every spawn spot the game picks (human and bots)
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    auto it = g_fns.find(fn);
+    if (it != g_fns.end() && it->second.name == "ModifyPlayerPosition") {
+      StartPt p{BEF(base, parms + 4), BEF(base, parms + 8), BEF(base, parms + 12), BE32(base, parms + 0x14)};
+      bool known = !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z);
+      for (auto& q : g_starts) if (std::fabs(q.x - p.x) + std::fabs(q.y - p.y) + std::fabs(q.z - p.z) < 64) { known = true; break; }
+      if (!known && g_starts.size() < 256) g_starts.push_back(p);
+    }
+  }
   if (t_mpp_bot && n > kWarmup && parms && BE32(base, parms) == t_mpp_bot) { SpreadBotSpawn(base, parms); t_mpp_bot = 0; }
+  // Unlock-all (Hayden 11-07): profile rank = profile ADAM vs UserProfile.GetAdamRequiredForRank(rank). The kill path
+  // (AddKillADAM -> UserProfile.AddAdam) asks it after every ADAM gain; answering 0 lets the profile rank up to max and
+  // the game saves it like a normal rank-up. Parms: int Rank @+0, int ReturnValue @+4 (logged once to confirm).
+  if (n > kWarmup && g_cfg.unlockall && parms && Readable(parms, 8)) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    auto it = g_fns.find(fn);
+    if (it != g_fns.end() && it->second.name == "GetAdamRequiredForRank") {
+      static int s_log = 0;
+      // Run 3 (11-07): the event is only the ADAM *cap* in UserProfile.AddAdam; the rank itself comes from
+      // UserProfile.CalculateRank (native) reading the mRankAdamRequirements table directly. So: find that table in the
+      // UserProfile (a TArray of ~40 ascending ints ending in the max-rank value this event returns, 97000) and zero it
+      // -> every rank needs 0 ADAM -> CalculateRank at match end gives max rank. Also log which profile ints changed
+      // since the last kill (to find the ADAM field for a permanent fix).
+      const uint32_t rank = BE32(base, parms), was = BE32(base, parms + 4);
+      if (g_spawn && s_log++ < 60) fprintf(g_spawn, "%9.3f  UNLOCKALL GetAdamRequiredForRank(%u) = %u (profile %08X)\n", Now(), rank, was, self);
+      static std::vector<uint32_t> s_prev;
+      std::vector<uint32_t> cur;
+      if (Readable(self, 0x1000)) {
+        for (uint32_t o = 0; o < 0x1000; o += 4) cur.push_back(BE32(base, self + o));
+        for (uint32_t o = 0x28; o + 12 <= 0x1000; o += 4) {   // TArray {Data, Num, Max}
+          uint32_t d = BE32(base, self + o), n = BE32(base, self + o + 4), mx = BE32(base, self + o + 8);
+          if (n < 20 || n > 80 || mx < n || mx > 256 || !Readable(d, n * 4)) continue;
+          bool asc = true; uint32_t has = 0;
+          for (uint32_t k = 0; k < n; ++k) { uint32_t v = BE32(base, d + k * 4); if (v == was && was > 1000) has = 1; if (k && v < BE32(base, d + (k - 1) * 4)) asc = false; }
+          if (!asc || !has) continue;
+          if (g_spawn) fprintf(g_spawn, "%9.3f  UNLOCKALL rank table at profile+%03X: %u entries (%u .. %u) -> zeroed\n", Now(), o, n, BE32(base, d), BE32(base, d + (n - 1) * 4));
+          for (uint32_t k = 0; k < n; ++k) W32(base, d + k * 4, 0);
+        }
+        if (s_prev.size() == cur.size() && g_spawn)
+          for (size_t k = 0; k < cur.size(); ++k)
+            if (cur[k] != s_prev[k] && int32_t(cur[k] - s_prev[k]) > 0 && int32_t(cur[k] - s_prev[k]) < 2000)
+              fprintf(g_spawn, "%9.3f  UNLOCKALL profile+%03zX %u -> %u (+%d)\n", Now(), k * 4, s_prev[k], cur[k], int32_t(cur[k] - s_prev[k]));
+        s_prev = cur;
+      }
+    }
+  }
+  if (n > kWarmup && parms) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    auto it = g_fns.find(fn);
+    if (it != g_fns.end() && IsStorageEvent(it->second.name)) StorageProbe(base, "post", it->second.full, self, parms);
+  }
+  if (n > kWarmup && g_cfg.unlockall) {
+    static std::set<uint32_t> s_done;
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    auto it = g_fns.find(fn);
+    if (it != g_fns.end() && it->second.cls == "UserProfile" && !s_done.count(self) && ZeroRankTable(base, self)) s_done.insert(self);
+  }
   // Pawn.EyePosition() returns a vector at parms+0: learn each pawn's eye height (relative or absolute form).
   if (n > kWarmup && parms && Readable(parms, 12) && Readable(self + kLoc, 12)) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
@@ -947,10 +1068,33 @@ extern "C" REX_FUNC(sub_82821AC0) {   // CallFunction(this r3, FFrame* r4, Resul
     ctx = keep;
   }
   uint32_t result = ctx.r5.u32;
+  // Newspaper box in the apartment = Rapture Tribune online leaderboards (Xbox Live stats) -> the offline SDK returns
+  // nothing and using it crashed (crash_20261107_145048, null read in the stats UI). Make it unusable.
+  bool news = false;
+  if (g_n_event.load() > kWarmup && result) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    auto it = g_fns.find(fn);
+    if (it != g_fns.end() && it->second.name == "CanBeUsedNow") {
+      PPCContext keep = ctx;   // ClassName runs guest code on ctx; the call below needs the original registers
+      news = Has(ClassName(ctx, base, self), "Newspaper");
+      ctx = keep;
+    }
+  }
   ++t_depth; __imp__sub_82821AC0(ctx, base); --t_depth;
+  if (news && Readable(result)) W32(base, result, 0);
   if (g_n_event.load() > kWarmup && result && Readable(result)) {   // remember IsInApartmentLobby() per GameInfo
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     auto it = g_fns.find(fn);
     if (it != g_fns.end() && it->second.name == "IsInApartmentLobby") g_lobby_gi[self] = BE32(base, result) != 0;
+    // Skip the apartment tutorial (Hayden 11-07): the apartment level script asks ActionGetApartmentIntro (an ActionBool)
+    // whether to run the first-time sequence (TV film, "go to the recording machine / gene bank / wardrobe", door to the
+    // Bathysphere unlocked last). Answer "no" -> free roam. Original value logged once to confirm the return slot.
+    if (g_cfg.skipintro && it != g_fns.end() && it->second.name == "execute" && Has(it->second.cls, "ActionGetApartmentIntro")) {
+      static int s_log = 0;
+      if (g_spawn && s_log++ < 5) fprintf(g_spawn, "%9.3f  SKIPINTRO ActionGetApartmentIntro.execute result was %08X -> 0\n", Now(), BE32(base, result));
+      W32(base, result, 0);
+    }
+    // (11-07: forcing IsAdamGatheringEnabled did NOT route kills to the profile - removed. Profile ADAM is paid in
+    // non-private matches: apartment -> 'admin DebugEndMatch' -> rotation match -> kill -> UserProfile.AddAdam.)
   }
 }
