@@ -1,0 +1,49 @@
+# Game data and anything derived from it — never commit
+game/
+game_*/
+dlc/
+iso_*/
+dumps/
+*.iso
+*.xex
+*.xbe
+*.xexp
+*.u
+*.upk
+*.bsm
+*.xma
+*.bik
+*.bin
+*.god
+*.stfs
+
+# Generated code (derived from the XEX) — keep only the SDK integration script
+app/generated/*
+!app/generated/rexglue.cmake
+
+# Build and run output (run/ holds test saves; docs/discs/ reports contain local paths)
+out/
+run/
+docs/discs/
+build/
+logs/
+*.log
+*.pdb
+*.ilk
+.vs/
+
+# Local SDK checkout
+.deps/
+
+timeline_shots/
+captures/
+*.cap
+*.rdc
+
+# Multiplayer recomp mirror (mp\, synced by tools\mp_sync.ps1): only sources/scripts/config
+mp/app/generated/*
+!mp/app/generated/rexglue.cmake
+mp/game_bs2
+
+# Installer downloads (extract-xiso)
+tools/bin/

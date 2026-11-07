@@ -1,0 +1,983 @@
+diff --git a/include/rex/graphics/split_view.h b/include/rex/graphics/split_view.h
+new file mode 100644
+index 0000000..bb4710b
+--- /dev/null
++++ b/include/rex/graphics/split_view.h
+@@ -0,0 +1,60 @@
++// bioshock-recomp: alternate-frame split view.
++// The game sets current_view on the game thread before building a frame; VdSwap stamps it into
++// the swap packet, and IssueSwap (GPU thread) routes frames tagged 1 to second_presenter.
++// The state lives in rexruntime.dll (src/system/split_view.cpp) so the exe, the kernel and the
++// GPU plugin all see one copy (header inline globals would be duplicated per DLL).
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace rex::ui {
++class Presenter;
++}
++
++namespace rex::graphics::split_view {
++
++inline constexpr uint32_t kTagMagic = 0x53504C00;  // 'SPL\0' | view
++
++struct State {
++  std::atomic<bool> enabled{false};
++  std::atomic<uint32_t> current_view{0};       // game thread: view of the frame being built
++  std::atomic<bool> invert{false};             // swap which window gets which view
++  std::atomic<ui::Presenter*> second_presenter{nullptr};
++  std::atomic<uint32_t> swap_view{0};          // GPU thread: view of the swap in flight
++  std::atomic<uint64_t> frames_routed[2] = {0, 0};
++  std::atomic<uint32_t> next_view{0};          // (unused since the frame queue; kept for layout)
++  // Frame queue: the game thread pushes the view of each frame it builds; VdSwap (guest render
++  // thread, which runs a frame or two behind) pops it. Lag-independent, unlike reading current_view
++  // at swap time, which tagged the NEXT frame's view whenever the render thread lagged a frame.
++  std::atomic<uint32_t> q_w{0}, q_r{0}, last_tag{0};
++  std::atomic<uint8_t> q[16] = {};
++};
++
++State& state();
++
++// Game thread, once per built frame. A full queue means swaps stopped (load / movie): start over.
++inline void PushFrameView(uint32_t view) {
++  State& st = state();
++  uint32_t w = st.q_w.load();
++  if (w - st.q_r.load() >= 6) st.q_r.store(w);
++  st.q[w & 15].store(uint8_t(view & 1));
++  st.q_w.store(w + 1);
++}
++// VdSwap: the view of the frame being swapped. Empty queue (loading-screen swaps from other threads)
++// = keep alternating from the last tag.
++inline uint32_t PopFrameView() {
++  State& st = state();
++  uint32_t r = st.q_r.load(), v;
++  if (r != st.q_w.load()) {
++    v = st.q[r & 15].load();
++    st.q_r.compare_exchange_strong(r, r + 1);
++  } else {
++    v = st.last_tag.load() ^ 1u;
++  }
++  st.last_tag.store(v);
++  return v;
++}
++inline void ResetFrameQueue() { State& st = state(); st.q_r.store(st.q_w.load()); }
++
++}  // namespace rex::graphics::split_view
+diff --git a/include/rex/input/input_driver.h b/include/rex/input/input_driver.h
+index 52116f1..c174976 100644
+--- a/include/rex/input/input_driver.h
++++ b/include/rex/input/input_driver.h
+@@ -46,6 +46,9 @@ class InputDriver {
+ 
+   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+ 
++  // bioshock-recomp: lets the app gate keyboard/mouse separately from controllers.
++  virtual bool is_keyboard_mouse() const { return false; }
++
+   void set_is_active_callback(std::function<bool()> is_active_callback) {
+     is_active_callback_ = is_active_callback;
+   }
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..97427f6 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -38,6 +38,8 @@ class InputSystem : public system::IInputSystem {
+   void AddDriver(std::unique_ptr<InputDriver> driver);
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
++  // bioshock-recomp: separate gates for controllers and the keyboard/mouse driver.
++  void SetActiveCallbacks(std::function<bool()> pads, std::function<bool()> keyboard_mouse);
+ 
+   /// Replaces any previous assignment. Call before the guest starts polling.
+   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index c8751b7..b200d23 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -43,6 +43,7 @@ class MnkInputDriver final : public InputDriver,
+                               X_INPUT_KEYSTROKE* out_keystroke) override;
+ 
+   void OnWindowAvailable(rex::ui::Window* window) override;
++  bool is_keyboard_mouse() const override { return true; }
+ 
+   // WindowInputListener
+   void OnKeyDown(rex::ui::KeyEvent& e) override;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..8bbde51 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/dbg.h>
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
++#include <rex/graphics/split_view.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+@@ -956,7 +957,15 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
+   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
++  uint32_t consumed = 4;
++  uint32_t view = 0;
++  if (count >= 5) {
++    uint32_t tag = reader->ReadAndSwap<uint32_t>();
++    consumed = 5;
++    if ((tag & 0xFFFFFF00u) == split_view::kTagMagic) view = tag & 1;
++  }
++  split_view::state().swap_view = view;
++  reader->AdvanceRead((count - consumed) * sizeof(uint32_t));
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+ 
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..0ac0eef 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,15 +10,20 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cstdarg>
++#include <cstdlib>
+ #include <cstring>
+ #include <sstream>
+ #include <utility>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/perf/counter.h>
++#include <rex/graphics/split_view.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/graphics_system.h>
+ #include <rex/graphics/d3d12/shader.h>
+@@ -31,6 +36,32 @@
+ #include <rex/memory/utils.h>
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
++#include <rex/ui/renderdoc_api.h>
++
++// bioshock-recomp: skip draws whose guest pixel shader ucode hash is listed (hex, comma-separated).
++// Used to drop the BioShock 360 blur/composite draw (PS 32B3EC0C91CA5BCC). Empty = off.
++REXCVAR_DEFINE_STRING(skip_pixel_shaders, "", "GPU/D3D12",
++                      "Comma-separated guest pixel shader hashes whose draws are skipped")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// bioshock-recomp: shift texture-fetch exp_adjust for >=1280-wide k_10_11_11 textures (pairs with resolve_1011_exp_bias).
++REXCVAR_DEFINE_INT32(fetch_1011_exp_adjust_delta, 0, "GPU/D3D12", "Delta added to exp_adjust of wide k_10_11_11 fetches");
++// bioshock-recomp: in the final composite (PS 32B3EC0C91CA5BCC), bind the full-res scene texture in
++// place of the 320-wide blurred copy, so the blur blend mixes sharp with sharp.
++REXCVAR_DEFINE_BOOL(bioshock_sharp_composite, false, "GPU/D3D12",
++                    "BioShock: feed the sharp scene into the blur slot of the final composite");
++
++// bioshock-recomp: final composite PS 32B3EC0C91CA5BCC computes
++//   out = gamma(saturate((bloom320 * c1.x + scene) * c2.x))
++// c1.x = bloom strength, c2.x = exposure. These scale them (1.0 = game value).
++REXCVAR_DEFINE_DOUBLE(bioshock_bloom_scale, 1.0, "GPU/D3D12", "BioShock: multiplier on composite bloom strength (c1.x)");
++REXCVAR_DEFINE_DOUBLE(bioshock_gamma, 1.0, "GPU/D3D12", "BioShock: shadow lift; divides the composite output gamma exponent (c254.z). >1 = brighter shadows");
++REXCVAR_DEFINE_DOUBLE(bioshock_exposure_scale, 1.0, "GPU/D3D12", "BioShock: multiplier on composite exposure (c2.x)");
++
++// bioshock-recomp: log guest frames slower than this (ms) with what happened in them. 0 = off.
++REXCVAR_DEFINE_INT32(hitch_log_ms, 0, "GPU/D3D12", "Log guest frames slower than N ms with PSO/texture activity");
++std::atomic<uint32_t> g_bs_pso_new{0};
++extern std::atomic<uint32_t> g_bs_tex_loads;
++extern std::atomic<uint64_t> g_bs_tex_load_us;
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -1900,6 +1931,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   if (!graphics_system_)
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
++  // bioshock-recomp split view: frames tagged for view 1 go to the second window's presenter.
++  if (split_view::state().swap_view.load() == 1) {
++    if (ui::Presenter* second = split_view::state().second_presenter.load()) presenter = second;
++  }
++  split_view::state().frames_routed[presenter == graphics_system_->presenter() ? 0 : 1]++;
+   if (!presenter) {
+     REXGPU_ERROR("IssueSwap: presenter is null");
+     return;
+@@ -2254,6 +2290,64 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
++
++  // bioshock-recomp: hitch logger.
++  {
++    static auto s_last = std::chrono::steady_clock::now();
++    static uint64_t s_frame = 0;
++    auto now = std::chrono::steady_clock::now();
++    double ms = std::chrono::duration<double, std::milli>(now - s_last).count();
++    s_last = now;
++    ++s_frame;
++    uint32_t pso = g_bs_pso_new.exchange(0, std::memory_order_relaxed);
++    uint32_t tex = g_bs_tex_loads.exchange(0, std::memory_order_relaxed);
++    uint64_t tex_us = g_bs_tex_load_us.exchange(0, std::memory_order_relaxed);
++    static auto s_fps_t0 = now;
++    static uint32_t s_fps_frames = 0;
++    ++s_fps_frames;
++    double fps_window = std::chrono::duration<double>(now - s_fps_t0).count();
++    if (fps_window >= 5.0) {
++      if (REXCVAR_GET(hitch_log_ms) > 0) {
++        REXGPU_INFO("bioshock-recomp: guest fps {:.1f}", s_fps_frames / fps_window);
++      }
++      s_fps_t0 = now;
++      s_fps_frames = 0;
++    }
++    static bool s_mark_was_down = false;
++    bool mark_down = (::GetAsyncKeyState(VK_F10) & 0x8000) != 0;
++    if (mark_down && !s_mark_was_down) {
++      REXGPU_WARN("bioshock-recomp: USER MARK (F10) at guest frame {}", s_frame);
++    }
++    s_mark_was_down = mark_down;
++    int32_t limit = REXCVAR_GET(hitch_log_ms);
++    if (limit > 0 && s_frame > 1 && ms > double(limit)) {
++      REXGPU_INFO("bioshock-recomp: HITCH {:.1f} ms | new PSOs {} | texture loads {} ({:.1f} ms)", ms,
++                  pso, tex, double(tex_us) / 1000.0);
++    }
++  }
++  // bioshock-recomp: press F11 in-game (with RenderDoc attached) to capture exactly one guest
++  // frame, swap to swap. The presenter runs faster than the guest, so RenderDoc's normal
++  // Present-delimited captures usually contain no guest rendering.
++  {
++    static std::unique_ptr<ui::RenderDocAPI> s_rdoc = ui::RenderDocAPI::CreateIfConnected();
++    static bool s_rdoc_capturing = false;
++    static bool s_rdoc_key_was_down = false;
++    if (s_rdoc) {
++      const RENDERDOC_API_1_0_0* rdoc = s_rdoc->api_1_0_0();
++      if (s_rdoc_capturing) {
++        rdoc->EndFrameCapture(nullptr, nullptr);
++        s_rdoc_capturing = false;
++        REXGPU_INFO("bioshock-recomp: RenderDoc guest-frame capture ended");
++      }
++      bool key_down = ((::GetAsyncKeyState(VK_F11) | ::GetAsyncKeyState(VK_F10)) & 0x8000) != 0;
++      if (key_down && !s_rdoc_key_was_down) {
++        rdoc->StartFrameCapture(nullptr, nullptr);
++        s_rdoc_capturing = true;
++        REXGPU_INFO("bioshock-recomp: RenderDoc guest-frame capture started");
++      }
++      s_rdoc_key_was_down = key_down;
++    }
++  }
+ }
+ 
+ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+@@ -2324,6 +2418,77 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       return true;
+     }
+   }
++  if (pixel_shader) {
++    static const std::vector<uint64_t> s_skip_ps = [] {
++      std::vector<uint64_t> v;
++      std::string list = REXCVAR_GET(skip_pixel_shaders);
++      size_t pos = 0;
++      while (pos < list.size()) {
++        size_t end = list.find(',', pos);
++        if (end == std::string::npos) end = list.size();
++        std::string item = list.substr(pos, end - pos);
++        if (!item.empty()) v.push_back(std::strtoull(item.c_str(), nullptr, 16));
++        pos = end + 1;
++      }
++      for (uint64_t h : v) REXGPU_INFO("bioshock-recomp: skipping draws with PS {:016X}", h);
++      return v;
++    }();
++    if (!s_skip_ps.empty() &&
++        std::find(s_skip_ps.begin(), s_skip_ps.end(), pixel_shader->ucode_data_hash()) !=
++            s_skip_ps.end()) {
++      return true;
++    }
++  }  {
++    // Undo a previous injection if the game has not rewritten that fetch slot since.
++    static int32_t s_inj_slot = -1;
++    static uint32_t s_orig[6], s_injected[6];
++    uint32_t* fv = &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
++    if (s_inj_slot >= 0) {
++      uint32_t* d = fv + s_inj_slot * 6;
++      if (std::memcmp(d, s_injected, sizeof(s_injected)) == 0) {
++        std::memcpy(d, s_orig, sizeof(s_orig));
++        cbuffer_binding_fetch_.up_to_date = false;
++        texture_cache_->TextureFetchConstantWritten(uint32_t(s_inj_slot));
++      }
++      s_inj_slot = -1;
++    }
++    if (pixel_shader && REXCVAR_GET(bioshock_sharp_composite) &&
++        pixel_shader->ucode_data_hash() == UINT64_C(0x32B3EC0C91CA5BCC)) {
++      auto is_1011 = [](const uint32_t* d) {
++        uint32_t fmt = d[1] & 0x3Fu;
++        return (d[0] & 3u) == 2u && (fmt == 16u || fmt == 55u);
++      };
++      int32_t wide = -1, narrow = -1;
++      for (int32_t t = 0; t < 32; ++t) {
++        const uint32_t* d = fv + t * 6;
++        if (!is_1011(d)) continue;
++        uint32_t w = (d[2] & 0x1FFFu) + 1u;
++        if (w >= 1280u && wide < 0) wide = t;
++        if (w >= 256u && w < 1280u && narrow < 0) narrow = t;
++      }
++      static int s_logged = 0;
++      if (s_logged < 3) {
++        ++s_logged;
++        std::string slots;
++        for (int32_t t = 0; t < 32; ++t) {
++          const uint32_t* d = fv + t * 6;
++          if ((d[0] & 3u) != 2u) continue;
++          slots += fmt::format(" [{}:fmt{} {}x{}]", t, d[1] & 0x3Fu, (d[2] & 0x1FFFu) + 1u,
++                               ((d[2] >> 13) & 0x1FFFu) + 1u);
++        }
++        REXGPU_INFO("bioshock-recomp: sharp composite wide={} narrow={} tex:{}", wide, narrow, slots);
++      }
++      if (wide >= 0 && narrow >= 0) {
++        uint32_t* d = fv + narrow * 6;
++        std::memcpy(s_orig, d, sizeof(s_orig));
++        std::memcpy(d, fv + wide * 6, sizeof(s_orig));
++        std::memcpy(s_injected, d, sizeof(s_injected));
++        s_inj_slot = narrow;
++        cbuffer_binding_fetch_.up_to_date = false;
++        texture_cache_->TextureFetchConstantWritten(uint32_t(narrow));
++      }
++    }
++  }
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+ 
+@@ -4148,6 +4313,29 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+               float_constants,
+               &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+               4 * sizeof(float));
++          if (i == 3 && float_constant_index == 62 &&
++              pixel_shader->ucode_data_hash() == UINT64_C(0x32B3EC0C91CA5BCC)) {
++            float* fc = reinterpret_cast<float*>(float_constants);
++            static int s_logged254 = 0;
++            if (s_logged254 < 2) {
++              ++s_logged254;
++              REXGPU_INFO("bioshock-recomp: composite c254 = {} {} {} {}", fc[0], fc[1], fc[2], fc[3]);
++            }
++            double g = REXCVAR_GET(bioshock_gamma);
++            if (g > 0.0) fc[2] = float(fc[2] / g);
++          }
++          if (i == 0 && (float_constant_index == 1 || float_constant_index == 2) &&
++              pixel_shader->ucode_data_hash() == UINT64_C(0x32B3EC0C91CA5BCC)) {
++            float* fc = reinterpret_cast<float*>(float_constants);
++            static int s_logged = 0;
++            if (s_logged < 4) {
++              ++s_logged;
++              REXGPU_INFO("bioshock-recomp: composite c{} = {} {} {} {}", float_constant_index,
++                          fc[0], fc[1], fc[2], fc[3]);
++            }
++            fc[0] *= float(float_constant_index == 1 ? REXCVAR_GET(bioshock_bloom_scale)
++                                                     : REXCVAR_GET(bioshock_exposure_scale));
++          }
+           float_constants += 4 * sizeof(float);
+         }
+       }
+@@ -4177,7 +4365,19 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+       return false;
+     }
+     std::memcpy(fetch_constants, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+-    cbuffer_binding_fetch_.up_to_date = true;
++    if (int32_t adj = REXCVAR_GET(fetch_1011_exp_adjust_delta)) {
++      uint32_t* fc = reinterpret_cast<uint32_t*>(fetch_constants);
++      for (uint32_t t = 0; t < 32; ++t) {
++        uint32_t* d = fc + t * 6;
++        if ((d[0] & 3u) != 2u) continue;                       // kTexture
++        uint32_t fmt = d[1] & 0x3Fu;
++        if (fmt != 16u && fmt != 55u) continue;                // k_10_11_11 (+ AS_16)
++        if ((d[2] & 0x1FFFu) + 1u < 1280u) continue;           // full-res only
++        int32_t ea = int32_t(d[3] << 13) >> 26;                // bits 13..18, signed
++        ea = std::clamp(ea + adj, -32, 31);
++        d[3] = (d[3] & ~(0x3Fu << 13)) | ((uint32_t(ea) & 0x3Fu) << 13);
++      }
++    }    cbuffer_binding_fetch_.up_to_date = true;
+     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_fetch_constants);
+   }
+ 
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 8e6b854..e3ccd5f 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -62,6 +62,10 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
+ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
+                     "Render tessellation as wireframe");
+ 
++#include <atomic>
++// bioshock-recomp: hitch logger counter, defined in command_processor.cpp.
++extern std::atomic<uint32_t> g_bs_pso_new;
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1008,6 +1012,7 @@ bool PipelineCache::ConfigurePipeline(
+     }
+   }
+   PROFILE_PIPELINE_CACHE_MISS();
++  ::g_bs_pso_new.fetch_add(1, std::memory_order_relaxed);
+ 
+   Pipeline* new_pipeline = new Pipeline;
+   std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..69a9904 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -46,6 +46,11 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
++// bioshock-recomp: depth->color ownership transfers leave alpha untouched. BioShock aliases depth as
++// color and reads the top byte (alpha) as its blur amount; keeping alpha at 0 removes the blur.
++REXCVAR_DEFINE_BOOL(transfer_depth_to_color_keep_alpha, false, "GPU/D3D12",
++                    "Depth->color RT transfers write RGB only (BioShock blur removal)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::graphics::d3d12 {
+ 
+@@ -3724,7 +3729,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
+     pipelines = stencil_pipelines_created ? stencil_bit_pipelines.data() : nullptr;
+   } else {
+     if (dest_is_color) {
+-      pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++      pipeline_desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
++          (key.mode == TransferMode::kDepthToColor && REXCVAR_GET(transfer_depth_to_color_keep_alpha))
++              ? UINT8(D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN |
++                      D3D12_COLOR_WRITE_ENABLE_BLUE)
++              : UINT8(D3D12_COLOR_WRITE_ENABLE_ALL);
+       pipeline_desc.NumRenderTargets = 1;
+       pipeline_desc.RTVFormats[0] = GetColorOwnershipTransferDXGIFormat(dest_color_format);
+     } else {
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index 2c31a0e..e01a456 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -26,6 +26,7 @@
+ 
+ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in DXBC");
+ 
++REXCVAR_DEFINE_BOOL(bioshock_kill_runaway_vertices, true, "GPU/Shader", "BioShock: kill primitives whose vertex position is non-finite or |W| > 1e8 (garbage skinning -> screen-wide streaks)");
+ REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+ 
+ namespace rex::graphics {
+@@ -1008,6 +1009,16 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+     }
+   }
+ 
++  // bioshock-recomp: a vertex with a garbage position (e.g. W ~ 1e29 from a bad bone
++  // matrix on a ragdoll) stretches its triangles across the screen. Kill them: W = NaN.
++  if (REXCVAR_GET(bioshock_kill_runaway_vertices)) {
++    // temp.x = |W| < 1e8 (false for NaN/inf too)
++    a_.OpLT(temp_x_dest, dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW).Abs(),
++            dxbc::Src::LF(1.0e8f));
++    a_.OpMovC(dxbc::Dest::R(system_temp_position_, 0b1000), temp_x_src,
++              dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW), dxbc::Src::LF(std::nanf("")));
++  }
++
+   // Write the position to the output.
+   a_.OpMov(dxbc::Dest::O(out_reg_vs_position_), dxbc::Src::R(system_temp_position_));
+ 
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index 31de175..ddc389c 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -27,6 +27,8 @@
+ REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
+                     "Scale texture offsets with draw resolution");
+ 
++REXCVAR_DEFINE_BOOL(vfetch_bounds_check, true, "GPU/Shader", "Vertex fetches past the end of the vertex buffer return 0 (real hardware behaviour) instead of reading following memory");
++
+ namespace rex::graphics {
+ using namespace ucode;
+ 
+@@ -209,6 +211,38 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+   }
+   a_.OpEndIf();
+ 
++  // bioshock-recomp: bounds check (see FIXME above). Elements past the end of the vertex
++  // buffer (fetch constant size) read 0 like on real hardware instead of whatever follows
++  // in memory - BioShock ragdolls fetch one vertex past the end and get garbage bone data.
++  if (REXCVAR_GET(vfetch_bounds_check) && instr.attributes.stride) {
++    uint32_t bc_temp = PushSystemTemp();
++    // x = base address, y = size in bytes (24-bit dword count at dword1 bit 2).
++    a_.OpAnd(dxbc::Dest::R(bc_temp, 0b0001), fetch_constant_src.SelectFromSwizzled(0),
++             dxbc::Src::LU(~uint32_t(3)));
++    a_.OpUBFE(dxbc::Dest::R(bc_temp, 0b0010), dxbc::Src::LU(24), dxbc::Src::LU(2),
++              fetch_constant_src.SelectFromSwizzled(1));
++    a_.OpIShL(dxbc::Dest::R(bc_temp, 0b0010), dxbc::Src::R(bc_temp, dxbc::Src::kYYYY), dxbc::Src::LU(2));
++    // z = size != 0 (unknown size: do not clamp).
++    a_.OpINE(dxbc::Dest::R(bc_temp, 0b0100), dxbc::Src::R(bc_temp, dxbc::Src::kYYYY), dxbc::Src::LU(0));
++    // x = buffer end.
++    a_.OpIAdd(dxbc::Dest::R(bc_temp, 0b0001), dxbc::Src::R(bc_temp, dxbc::Src::kXXXX),
++              dxbc::Src::R(bc_temp, dxbc::Src::kYYYY));
++    // y = end of the words this fetch reads.
++    uint32_t last_word_index = 0;
++    for (uint32_t w = needed_words; w >>= 1;) ++last_word_index;
++    a_.OpIAdd(dxbc::Dest::R(bc_temp, 0b0010),
++              dxbc::Src::R(system_temp_grad_v_vfetch_address_, dxbc::Src::kWWWW),
++              dxbc::Src::LI((instr.attributes.offset + int32_t(last_word_index) + 1) * int32_t(sizeof(uint32_t))));
++    // x = out of bounds = (buffer end < read end) && size known.
++    a_.OpULT(dxbc::Dest::R(bc_temp, 0b0001), dxbc::Src::R(bc_temp, dxbc::Src::kXXXX),
++             dxbc::Src::R(bc_temp, dxbc::Src::kYYYY));
++    a_.OpAnd(dxbc::Dest::R(bc_temp, 0b0001), dxbc::Src::R(bc_temp, dxbc::Src::kXXXX),
++             dxbc::Src::R(bc_temp, dxbc::Src::kZZZZ));
++    a_.OpMovC(dxbc::Dest::R(system_temp_result_, needed_words), dxbc::Src::R(bc_temp, dxbc::Src::kXXXX),
++              dxbc::Src::LU(0), dxbc::Src::R(system_temp_result_));
++    PopSystemTemp();
++  }
++
+   dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
+ 
+   // - Endian swap the words.
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..24c79e5 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -25,6 +25,12 @@
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <atomic>
++#include <chrono>
++
++// bioshock-recomp: hitch logger counters (read and reset in D3D12CommandProcessor::IssueSwap).
++std::atomic<uint32_t> g_bs_tex_loads{0};
++std::atomic<uint64_t> g_bs_tex_load_us{0};
+ 
+ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
+                      "Texture cache memory limit for render-to-texture (MB)")
+@@ -881,6 +887,16 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+ }
+ 
+ bool TextureCache::LoadTextureData(Texture& texture) {
++  struct BsTexTimer {
++    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++    ~BsTexTimer() {
++      g_bs_tex_loads.fetch_add(1, std::memory_order_relaxed);
++      g_bs_tex_load_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                              std::chrono::steady_clock::now() - t0)
++                                              .count()),
++                                 std::memory_order_relaxed);
++    }
++  } bs_tex_timer;
+   PendingTextureLoad pending_load;
+   PendingSharedMemoryRange pending_ranges[2];
+   size_t pending_range_count = 0;
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..fb9624a 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -27,6 +27,11 @@
+ #include <rex/ui/graphics_util.h>
+ 
+ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
++// bioshock-recomp: override copy_dest_exp_bias for 7e3 -> k_10_11_11 / k_11_11_10 resolves. 99 = off.
++REXCVAR_DEFINE_INT32(resolve_1011_exp_bias, 99, "GPU", "Override exp bias for 7e3 to 10_11_11 resolves (99 = off)");
++// bioshock-recomp: drop full-res 7e3 -> 10_11_11 resolves whose ORIGINAL exp bias equals this value
++// (the second, near-empty copy that overwrites the sharp scene before the final composite). 99 = off.
++REXCVAR_DEFINE_INT32(skip_hdr_1011_resolve_bias, 99, "GPU", "Skip full-res 7e3->10_11_11 resolves with this original exp bias (99 = off)");
+ 
+ REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
+                     "Fill half pixel offset during resolution scale resolve");
+@@ -865,11 +870,58 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+ 
+   // Clamp to the EDRAM surface pitch (maximum possible surface pitch is also
+   // assumed to be the largest resolvable size).
++  // bioshock-recomp: depth resolves can arrive with a stale (half-width) RB_SURFACE_INFO pitch.
++  // If the resolve is wider than that pitch and the destination texture is wide enough, use the
++  // destination pitch for EDRAM addressing instead of clamping.
++  uint32_t resolve_surface_pitch = rb_surface_info.surface_pitch;
++  {
++    auto fix_dp = regs.Get<reg::RB_COPY_DEST_PITCH>();
++    if (uint32_t(rb_copy_control.copy_src_select) >= xenos::kMaxColorRenderTargets &&
++        uint32_t(x1) > resolve_surface_pitch && uint32_t(fix_dp.copy_dest_pitch) >= uint32_t(x1)) {
++      static bool s_depth_pitch_logged = false;
++      if (!s_depth_pitch_logged) {
++        s_depth_pitch_logged = true;
++        REXGPU_WARN("bioshock-recomp: depth resolve pitch override {} -> {}", resolve_surface_pitch,
++                    uint32_t(fix_dp.copy_dest_pitch));
++      }
++      resolve_surface_pitch = uint32_t(fix_dp.copy_dest_pitch);
++    }
++  }
+   int32_t surface_pitch_aligned =
+-      int32_t(rb_surface_info.surface_pitch & ~uint32_t(xenos::kResolveAlignmentPixels - 1));
++      int32_t(resolve_surface_pitch & ~uint32_t(xenos::kResolveAlignmentPixels - 1));
+   if (x1 > surface_pitch_aligned) {
+     REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {}", x0, x1,
+                  surface_pitch_aligned);
++    // bioshock-recomp diagnostics: dump the state behind the clamp (first 16 hits only).
++    static int s_resolve_pitch_diag = 0;
++    if (s_resolve_pitch_diag < 16) {
++      ++s_resolve_pitch_diag;
++      REXGPU_ERROR(
++          "  diag: y {}..{} msaa={}x pitch_raw={} scissor=({},{} {}x{}) "
++          "window_offset=({},{}) vtx_window_offset_enable={}",
++          y0, y1, uint32_t(1) << uint32_t(rb_surface_info.msaa_samples),
++          uint32_t(rb_surface_info.surface_pitch), scissor.offset[0], scissor.offset[1],
++          scissor.extent[0], scissor.extent[1], int32_t(pa_sc_window_offset.window_x_offset),
++          int32_t(pa_sc_window_offset.window_y_offset),
++          uint32_t(regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable));
++      uint32_t diag_src = uint32_t(rb_copy_control.copy_src_select);
++      auto diag_dp = regs.Get<reg::RB_COPY_DEST_PITCH>();
++      auto diag_di = regs.Get<reg::RB_COPY_DEST_INFO>();
++      uint32_t diag_rt_fmt = 0xFF, diag_edram_base;
++      if (diag_src < 4) {
++        auto ci = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[diag_src]);
++        diag_rt_fmt = uint32_t(ci.color_format);
++        diag_edram_base = ci.color_base;
++      } else {
++        diag_edram_base = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
++      }
++      REXGPU_ERROR(
++          "  diag2: src={} rt_fmt={} edram_base={} dest_pitch={} dest_height={} dest_fmt={} "
++          "dest_base=0x{:08X}",
++          diag_src, diag_rt_fmt, diag_edram_base, uint32_t(diag_dp.copy_dest_pitch),
++          uint32_t(diag_dp.copy_dest_height), uint32_t(diag_di.copy_dest_format),
++          uint32_t(regs[XE_GPU_REG_RB_COPY_DEST_BASE]));
++    }
+     x0 = std::min(x0, surface_pitch_aligned);
+     x1 = std::min(x1, surface_pitch_aligned);
+   }
+@@ -1020,7 +1072,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+       (x0_samples % xenos::kEdramTileWidthSamples) >> (sample_count_log2_x + 3);
+   info_out.coordinate_info.edram_offset_y_div_8 =
+       (y0_samples % xenos::kEdramTileHeightSamples) >> (sample_count_log2_y + 3);
+-  uint32_t surface_pitch_tiles = xenos::GetSurfacePitchTiles(rb_surface_info.surface_pitch,
++  uint32_t surface_pitch_tiles = xenos::GetSurfacePitchTiles(resolve_surface_pitch,
+                                                              rb_surface_info.msaa_samples, false);
+   uint32_t edram_base_offset_tiles =
+       base_offset_y_tiles * surface_pitch_tiles + base_offset_x_tiles;
+@@ -1032,6 +1084,37 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+       REXCVAR_GET(half_pixel_offset) &&
+       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
+   int32_t exp_bias = is_depth ? 0 : rb_copy_dest_info.copy_dest_exp_bias;
++  if (!is_depth && REXCVAR_GET(resolve_1011_exp_bias) != 99 && (x1 - x0) >= 1280 &&
++      (dest_format == xenos::TextureFormat::k_10_11_11 ||
++       dest_format == xenos::TextureFormat::k_11_11_10)) {
++    auto src_fmt = regs.Get<reg::RB_COLOR_INFO>(
++                       reg::RB_COLOR_INFO::rt_register_indices[rb_copy_control.copy_src_select])
++                       .color_format;
++    if (src_fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
++        src_fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
++      exp_bias = REXCVAR_GET(resolve_1011_exp_bias);
++    }
++  }
++  if (!is_depth && REXCVAR_GET(skip_hdr_1011_resolve_bias) != 99 && (x1 - x0) >= 1280 &&
++      int32_t(rb_copy_dest_info.copy_dest_exp_bias) == REXCVAR_GET(skip_hdr_1011_resolve_bias) &&
++      (dest_format == xenos::TextureFormat::k_10_11_11 ||
++       dest_format == xenos::TextureFormat::k_11_11_10)) {
++    auto skip_src_fmt = regs.Get<reg::RB_COLOR_INFO>(
++                            reg::RB_COLOR_INFO::rt_register_indices[rb_copy_control.copy_src_select])
++                            .color_format;
++    if (skip_src_fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
++        skip_src_fmt == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16) {
++      static int s_skip_logged = 0;
++      if (s_skip_logged < 3) {
++        ++s_skip_logged;
++        REXGPU_INFO("bioshock-recomp: skipped HDR 10_11_11 resolve to 0x{:08X} (bias {})",
++                    rb_copy_dest_base, int32_t(rb_copy_dest_info.copy_dest_exp_bias));
++      }
++      info_out.coordinate_info.width_div_8 = 0;
++      info_out.height_div_8 = 0;
++      return true;
++    }
++  }
+   ResolveEdramInfo depth_edram_info;
+   depth_edram_info.packed = 0;
+   if (is_depth || rb_copy_control.depth_clear_enable) {
+@@ -1049,6 +1132,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+     info_out.depth_original_base = 0;
+   }
+   info_out.depth_edram_info = depth_edram_info;
++  uint32_t color_info_base_diag = 0;
+   ResolveEdramInfo color_edram_info;
+   color_edram_info.packed = 0;
+   if (!is_depth) {
+@@ -1076,6 +1160,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+       exp_bias = std::min(exp_bias + int32_t(5), int32_t(31));
+     }
+     info_out.color_original_base = color_info.color_base;
++    color_info_base_diag = color_info.color_base;
+   } else {
+     info_out.color_original_base = 0;
+   }
+@@ -1107,7 +1192,39 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                      xenos::ColorRenderTargetFormat(color_edram_info.format)),
+       dest_format_info.name, rb_copy_dest_base, copy_dest_extent_start, copy_dest_extent_end);
+ 
+-  return true;
++  // bioshock-recomp diag: log each unique resolve setup once (size, formats, exp bias, number format).
++  {
++    static uint64_t s_seen[96];
++    static uint32_t s_seen_count = 0;
++    uint64_t key = (uint64_t(uint32_t(x1)) << 48) ^ (uint64_t(uint32_t(y1)) << 36) ^
++                   (uint64_t(uint32_t(dest_format)) << 28) ^ (uint64_t(uint32_t(exp_bias) & 0x3F) << 22) ^
++                   (uint64_t(rb_copy_dest_info.copy_dest_number) << 19) ^ uint64_t(is_depth) ^
++                   (uint64_t(rb_copy_dest_base) << 1);
++    bool seen = false;
++    for (uint32_t i = 0; i < s_seen_count; ++i) seen |= (s_seen[i] == key);
++    if (!seen && s_seen_count < 96) {
++      s_seen[s_seen_count++] = key;
++      REXGPU_INFO(
++          "diag3 resolve: {}x{} src={} dest={} at 0x{:08X} exp_bias={} number={} swap={} "
++          "sample={} msaa={}x",
++          x1 - x0, y1 - y0,
++          is_depth ? xenos::GetDepthRenderTargetFormatName(
++                         xenos::DepthRenderTargetFormat(depth_edram_info.format))
++                   : xenos::GetColorRenderTargetFormatName(
++                         xenos::ColorRenderTargetFormat(color_edram_info.format)),
++          dest_format_info.name, rb_copy_dest_base, exp_bias,
++          uint32_t(rb_copy_dest_info.copy_dest_number), uint32_t(rb_copy_dest_info.copy_dest_swap),
++          uint32_t(sample_select), uint32_t(1) << uint32_t(rb_surface_info.msaa_samples));
++      REXGPU_INFO(
++          "diag3   where: x {}..{} y {}..{} edram_base={} (+{} tiles) pitch={}px pitch_tiles={} "
++          "64bpp={} win_off=({},{}) dest_pitch={} dest_h={}",
++          x0, x1, y0, y1, is_depth ? uint32_t(rb_depth_info.depth_base) : color_info_base_diag,
++          edram_base_offset_tiles, uint32_t(rb_surface_info.surface_pitch), surface_pitch_tiles,
++          is_depth ? 0u : uint32_t(color_edram_info.format_is_64bpp),
++          int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_x_offset),
++          int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset),
++          uint32_t(rb_copy_dest_pitch.copy_dest_pitch), uint32_t(rb_copy_dest_pitch.copy_dest_height));    }
++  }  return true;
+ }
+ 
+ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale_x,
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..6e87b7c 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -28,6 +28,7 @@
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <rex/graphics/split_view.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/shader/shader.h>
+@@ -2278,6 +2279,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   if (!graphics_system_)
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
++  // bioshock-recomp split view: frames tagged for view 1 go to the second window's presenter.
++  if (split_view::state().swap_view.load() == 1) {
++    if (ui::Presenter* second = split_view::state().second_presenter.load()) presenter = second;
++  }
++  split_view::state().frames_routed[presenter == graphics_system_->presenter() ? 0 : 1]++;
+   if (!presenter) {
+     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
+     return;
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..972f9da 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -71,6 +71,13 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+   }
+ }
+ 
++void InputSystem::SetActiveCallbacks(std::function<bool()> pads,
++                                     std::function<bool()> keyboard_mouse) {
++  for (auto& driver : drivers_) {
++    driver->set_is_active_callback(driver->is_keyboard_mouse() ? keyboard_mouse : pads);
++  }
++}
++
+ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
+   assignment_ = std::move(assignment);
+   if (assignment_) {
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066..4ba04b8 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <unordered_set>
+ #include <cstring>
+ 
+ #include <rex/cvar.h>
+@@ -351,11 +352,46 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+         user_profile->AddSetting(
+             std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
+       } break;
+-      case UserProfile::Setting::Type::WSTRING:
+-      case UserProfile::Setting::Type::DOUBLE:
+-      case UserProfile::Setting::Type::FLOAT:
++      // bioshock-recomp: numeric settings were dropped ("Unimplemented data type 1", 500+ per
++      // session), so option changes did not stick. Update in place when the setting exists, else add
++      // it in memory. Title-specific numeric settings are never added (AddSetting would write an
++      // empty file to disk: numeric settings have no serializer).
+       case UserProfile::Setting::Type::INT32:
+       case UserProfile::Setting::Type::INT64:
++      case UserProfile::Setting::Type::FLOAT:
++      case UserProfile::Setting::Type::DOUBLE: {
++        static std::unordered_set<uint32_t> s_logged;
++        const uint32_t id = setting.setting_id;
++        if (s_logged.insert(id).second) {
++          REXKRNL_INFO("XamUserWriteProfileSettings: setting {:08X} type {} (numeric, kept in memory)", id,
++                       setting.data.type);
++        }
++        auto* cur = user_profile->GetSetting(id);
++        if (cur && cur->type == setting_type) {
++          switch (setting_type) {
++            case UserProfile::Setting::Type::INT32:
++              static_cast<UserProfile::Int32Setting*>(cur)->value = setting.data.s32; break;
++            case UserProfile::Setting::Type::INT64:
++              static_cast<UserProfile::Int64Setting*>(cur)->value = setting.data.s64; break;
++            case UserProfile::Setting::Type::FLOAT:
++              static_cast<UserProfile::FloatSetting*>(cur)->value = setting.data.f32; break;
++            default:
++              static_cast<UserProfile::DoubleSetting*>(cur)->value = setting.data.f64; break;
++          }
++        } else if (!cur && (id & 0x3F00) != 0x3F00) {
++          switch (setting_type) {
++            case UserProfile::Setting::Type::INT32:
++              user_profile->AddSetting(std::make_unique<UserProfile::Int32Setting>(id, setting.data.s32)); break;
++            case UserProfile::Setting::Type::INT64:
++              user_profile->AddSetting(std::make_unique<UserProfile::Int64Setting>(id, setting.data.s64)); break;
++            case UserProfile::Setting::Type::FLOAT:
++              user_profile->AddSetting(std::make_unique<UserProfile::FloatSetting>(id, setting.data.f32)); break;
++            default:
++              user_profile->AddSetting(std::make_unique<UserProfile::DoubleSetting>(id, setting.data.f64)); break;
++          }
++        }
++      } break;
++      case UserProfile::Setting::Type::WSTRING:
+       case UserProfile::Setting::Type::DATETIME:
+       default: {
+         REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..c4ac9d0 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -19,6 +19,7 @@
+ #include <rex/cvar.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/register_file.h>
++#include <rex/graphics/split_view.h>
+ #include <rex/graphics/video_mode_util.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+@@ -507,12 +508,22 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+   dwords[offset++] = gpu_fetch.dword_4;
+   dwords[offset++] = gpu_fetch.dword_5;
+ 
+-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
++  // bioshock-recomp: one extra word carries the split-view tag (see split_view.h).
++  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 5);
+   dwords[offset++] = rex::graphics::xenos::kSwapSignature;
+   dwords[offset++] = frontbuffer_physical_address;
+ 
+   dwords[offset++] = *width;
+   dwords[offset++] = *height;
++  {
++    namespace sv = rex::graphics::split_view;
++    // Always pop: the queue is a 1:1 stream with the game's frame builds whether routing is on or not.
++    // Popping only while enabled left the frame built before enabling unpopped, so every later swap took
++    // the NEXT frame's label (views on the wrong windows at spawn, 2026-11-03).
++    const uint32_t queued = sv::PopFrameView();
++    uint32_t view = sv::state().enabled.load() ? (queued ^ (sv::state().invert.load() ? 1u : 0u)) : 0u;
++    dwords[offset++] = sv::kTagMagic | view;
++  }
+ 
+   // Fill the rest of the buffer with NOP packets.
+   for (uint32_t i = offset; i < 64; i++) {
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d86..1a95440 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -21,6 +21,7 @@ set(REXSYSTEM_SOURCES
+     xobject.cpp
+     xmodule.cpp
+     guest_path.cpp
++    split_view.cpp  # bioshock-recomp
+ 
+     # Utilities
+     util/object_table.cpp
+diff --git a/src/system/split_view.cpp b/src/system/split_view.cpp
+new file mode 100644
+index 0000000..bb66f64
+--- /dev/null
++++ b/src/system/split_view.cpp
+@@ -0,0 +1,9 @@
++// bioshock-recomp: single shared instance of the split-view state (see split_view.h).
++#include <rex/graphics/split_view.h>
++
++namespace rex::graphics::split_view {
++State& state() {
++  static State s;
++  return s;
++}
++}  // namespace rex::graphics::split_view
+diff --git a/src/system/xex_module.cpp b/src/system/xex_module.cpp
+index 0726516..9966fd1 100644
+--- a/src/system/xex_module.cpp
++++ b/src/system/xex_module.cpp
+@@ -1156,10 +1156,66 @@ void XexModule::PopulateBinaryData() {
+     sec.virtual_size = pe_sec.size;
+     sec.host_data = memory()->TranslateVirtual<uint8_t*>(pe_sec.address);
+     sec.executable = (pe_sec.flags & kXEPESectionMemoryExecute) != 0;
++    // bioshock2-recomp: the XEX entry point is code whatever its PE section flags say (BioShock 2's
++    // entry 0x82010D10 sits in a section without the execute flag; codegen stubbed it and the
++    // runtime had no function registered there).
++    const uint32_t ep = entry_point();
++    if (!sec.executable && ep >= pe_sec.address && ep < pe_sec.address + pe_sec.size) {
++      REXLOG_INFO("section '{}' at {:08X} holds the entry point {:08X}: treating it as code", pe_sec.name, pe_sec.address, ep);
++      sec.executable = true;
++    }
+     sec.writable = (pe_sec.flags & kXEPESectionMemoryWrite) != 0;
+     binary_sections_.push_back(std::move(sec));
+   }
+ 
++  // bioshock2-recomp: the entry point can live outside every PE section (BioShock 2: 0x82010D10, below
++  // the first PE section). Codegen then never decodes it and the runtime has no function there. Synthesize
++  // a code section from the XEX page descriptors' CODE run that contains the entry point.
++  {
++    const uint32_t ep = entry_point();
++    bool covered = false;
++    for (const auto& sec : binary_sections_)
++      if (ep >= sec.virtual_address && ep < sec.virtual_address + sec.virtual_size) covered = true;
++    if (ep && !covered) {
++      auto* heap = memory()->LookupHeap(base_address_);
++      const uint32_t page_size = heap ? heap->page_size() : 0x1000;
++      const auto* si = xex_security_info();
++      uint32_t run_start = 0, run_end = 0;
++      for (uint32_t i = 0, page = 0; i < si->page_descriptor_count; i++) {
++        xex2_page_descriptor desc;
++        desc.value = rex::byte_swap(si->page_descriptors[i].value);
++        const uint32_t a = base_address_ + page * page_size, sz = desc.page_count * page_size;
++        if (desc.info == XEX_SECTION_CODE) {
++          if (run_end == a) run_end = a + sz; else { run_start = a; run_end = a + sz; }
++          if (ep >= run_start && ep < run_end) {
++            // extend through the following contiguous CODE pages
++            uint32_t p2 = page + desc.page_count;
++            for (uint32_t j = i + 1; j < si->page_descriptor_count; j++) {
++              xex2_page_descriptor d2; d2.value = rex::byte_swap(si->page_descriptors[j].value);
++              if (d2.info != XEX_SECTION_CODE) break;
++              run_end = base_address_ + (p2 + d2.page_count) * page_size; p2 += d2.page_count;
++            }
++            break;
++          }
++        } else { run_start = run_end = 0; }
++        page += desc.page_count;
++      }
++      if (run_end > run_start && ep >= run_start && ep < run_end) {
++        BinarySection sec;
++        sec.name = ".entry";
++        sec.virtual_address = run_start;
++        sec.virtual_size = run_end - run_start;
++        sec.host_data = memory()->TranslateVirtual<uint8_t*>(run_start);
++        sec.executable = true;
++        sec.writable = false;
++        REXLOG_INFO("entry point {:08X} is outside every PE section: added code section .entry {:08X}-{:08X}", ep, run_start, run_end);
++        binary_sections_.push_back(std::move(sec));
++      } else {
++        REXLOG_WARN("entry point {:08X} is outside every PE section and no XEX CODE page run covers it", ep);
++      }
++    }
++  }
++
+   // Populate symbols from import libraries
+   for (const auto& lib : import_libs_) {
+     for (const auto& import : lib.imports) {
