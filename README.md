@@ -25,6 +25,8 @@ Supported disc: `Bioshock2_Xenon.xex` SHA-1 `b4196d2bd339ff5e80ee1ce9100cb288bac
 
 ## In game
 - **F9** - cheat panel (single player): god mode, noclip, fly, teleport, game speed, give items, summon.
+- **MP weapon wheel** (single player): tap **D-pad Left 3 times**, aim with the right stick, **A** equips, **B** cancels.
+  Keyboard: **G**, then click or press 1-8.
 - F4 emulator settings, F3 debug overlay.
 
 ## Never share

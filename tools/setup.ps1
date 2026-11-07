@@ -26,7 +26,7 @@ Write-Host "clang: $clangLine"
 # Submodules (e.g. libmspack) contain git symlinks. On Windows they only check out correctly with
 # core.symlinks=true AND symlink rights (elevated shell or Developer Mode); otherwise they become text files.
 $probe = Join-Path $env:TEMP ("symlink_probe_" + [guid]::NewGuid())
-try { New-Item -ItemType SymbolicLink -Path $probe -Target $env:TEMP -ErrorAction Stop | Out-Null; Remove-Item $probe -Force }
+try { New-Item -ItemType SymbolicLink -Path $probe -Target $env:TEMP -ErrorAction Stop | Out-Null; [IO.Directory]::Delete($probe) }   # link only: Remove-Item prompts "has children" and with Y can empty %TEMP% (PS 5.1)
 catch { throw "Can't create symlinks. Run elevated or enable Developer Mode (Settings > System > For developers)." }
 
 # 1. SDK at the pinned tag
@@ -42,7 +42,10 @@ try {
     Get-ChildItem (Join-Path $Root "patches\rexglue-sdk\*.patch") -ErrorAction SilentlyContinue |
         Sort-Object Name | ForEach-Object {
             Write-Host "Applying $($_.Name)"
-            Invoke-Native git @("apply", "--whitespace=nowarn", $_.FullName)
+            # Normalize to LF: a zip/checkout with CRLF patches makes git apply fail on the SDK's LF sources.
+            $lf = Join-Path $env:TEMP ("rex_" + $_.Name)
+            [IO.File]::WriteAllText($lf, ([IO.File]::ReadAllText($_.FullName) -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+            Invoke-Native git @("apply", "--whitespace=nowarn", $lf)
         }
 
     # 3. Build + install (install prefix: out\install\win-amd64; registers find_package(rexglue))

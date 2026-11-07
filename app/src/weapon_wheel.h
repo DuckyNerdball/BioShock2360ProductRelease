@@ -2,7 +2,7 @@
 // BS2's own wheel is a Scaleform movie (HUDRadial) with fixed slots; foreign (BS1/MP) weapons have no slot there.
 // This is the quick version: an ImGui radial drawn over the game. The real version (a second ring inside the
 // HUDRadial movie) comes later - see docs.
-//   Controller: hold D-pad Down, aim with the right stick, release to equip.
+//   Controller: tap D-pad Left 3 times to open, aim with the right stick, A (or D-pad Left) equips, B cancels.
 //   Keyboard:   G opens/closes it; click a slot, or press 1-8.
 // Equipping happens on the game thread (bridge_loader.cpp, Bs2WheelRequest).
 #pragma once
@@ -14,7 +14,7 @@
 #include <cstdio>
 
 void Bs2WheelRequest(int slot);   // bridge_loader.cpp (game thread picks it up)
-struct Bs2WheelPad { std::atomic<bool> held{false}; std::atomic<int> rx{0}, ry{0}; };
+struct Bs2WheelPad { std::atomic<bool> held{false}, cancel{false}; std::atomic<int> rx{0}, ry{0}; };
 Bs2WheelPad& Bs2WheelPadState();  // bridge_cheats.cpp (filled by the guest pad hook, which also hides the input from the game)
 
 class WeaponWheelDialog : public rex::ui::ImGuiDialog {
@@ -53,7 +53,7 @@ class WeaponWheelDialog : public rex::ui::ImGuiDialog {
     }
 
     // commit
-    if (was_pad_open_ && !pad_open && last_pad_pick_ >= 0) { Fire(last_pad_pick_); }
+    if (was_pad_open_ && !pad_open && last_pad_pick_ >= 0 && !pad.cancel.exchange(false)) { Fire(last_pad_pick_); }
     if (!pad_open) last_pad_pick_ = -1;
     was_pad_open_ = pad_open;
     if (kb) {

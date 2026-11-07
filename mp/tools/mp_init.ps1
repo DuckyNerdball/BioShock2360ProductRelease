@@ -53,11 +53,13 @@ if (-not (Test-Path (Join-Path $Root "docs\STATUS.md"))) { "# bioshock2mp STATUS
 # 4. configure + codegen + reconfigure
 $Bl = Join-Path $Logs "build_init_$(Get-Date -Format yyyyMMdd_HHmmss).log"
 $hooks = if ($NoHooks) { "OFF" } else { "ON" }
+$RexCfg = Join-Path $Sp ".deps\rexglue-sdk\out\install\win-amd64\lib\cmake\rexglue"   # repo SDK (players); dev uses the registry
+$RexPin = @(); if (Test-Path $RexCfg) { $RexPin = @("-Drexglue_DIR=$RexCfg") }
 Push-Location $App
 try {
-    Invoke-Native cmake @("--preset", $Preset, "-DMP_SPAWNLOG=$hooks") $Bl
+    Invoke-Native cmake (@("--preset", $Preset, "-DMP_SPAWNLOG=$hooks") + $RexPin) $Bl
     Invoke-Native cmake @("--build", "--preset", $Preset, "--target", "bioshock2mp_codegen") $Bl
-    Invoke-Native cmake @("--preset", $Preset, "-DMP_SPAWNLOG=$hooks") $Bl
+    Invoke-Native cmake (@("--preset", $Preset, "-DMP_SPAWNLOG=$hooks") + $RexPin) $Bl
 } finally { Pop-Location }
 
 # 5. the hook addresses must be real function starts in the MP codegen (they were matched from SP by signature)
@@ -79,6 +81,7 @@ if ($NoImport) {   # players: the manifest already carries every declared functi
     try { Invoke-Native cmake @("--build", "--preset", $Preset) $Bl } finally { Pop-Location }
 } else { & (Join-Path $PSScriptRoot "import_functions.ps1") -Build }
 Copy-Item $Bl (Join-Path $Logs "build_last.log") -Force
+if ($NoImport) { Write-Host "Multiplayer built." -ForegroundColor Green; return }   # players: no dev hints
 Write-Host "`nDone. Next:" -ForegroundColor Green
 Write-Host "  .\tools\fix_loop.ps1 -RunSeconds 90       # boot to the MP front end, declaring missing functions as it goes"
 Write-Host "  .\go.ps1 -NoBuild                          # play; logs\mp_*.log / mp_vocab.tsv / mp_snap_*.txt"

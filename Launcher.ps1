@@ -51,7 +51,7 @@ $cbScale.SelectedItem = $(if ($cbScale.Items.Contains($s.Scale)) { $s.Scale } el
 
 New-Ctl Windows.Forms.Label 16 168 90 22 "Brightness" | Out-Null
 $tbExp = New-Ctl Windows.Forms.TextBox 110 166 60 24 $s.Exposure
-New-Ctl Windows.Forms.Label 176 168 80 22 "Gamma" | Out-Null
+New-Ctl Windows.Forms.Label 176 168 56 22 "Gamma" | Out-Null
 $tbGam = New-Ctl Windows.Forms.TextBox 236 166 60 24 $s.Gamma
 $lbHint = New-Ctl Windows.Forms.Label 304 168 150 22 "blank = look default"; $lbHint.ForeColor = $lbInfo.ForeColor
 
@@ -79,7 +79,9 @@ function Get-PlayArgs {
 function Start-Console([string]$cmd, [switch]$Keep) {
     $flags = @("-NoProfile", "-ExecutionPolicy", "Bypass")
     if ($Keep) { $flags += "-NoExit" }
-    Start-Process powershell -WorkingDirectory $Root -ArgumentList ($flags + @("-Command", $cmd))
+    # Errors stay on screen instead of the window vanishing.
+    $wrapped = "try { `$ErrorActionPreference = 'Stop'; $cmd } catch { Write-Host `$_ -ForegroundColor Red; Read-Host 'Press Enter to close' }"
+    Start-Process powershell -WorkingDirectory $Root -ArgumentList ($flags + @("-Command", $wrapped))
 }
 
 $btnPlay = New-Ctl Windows.Forms.Button 16 206 140 38 "Play"
@@ -98,7 +100,7 @@ $btnLogs.Add_Click({ $l = Join-Path $Root "logs"; New-Item -ItemType Directory $
 $btnFix = New-Ctl Windows.Forms.Button 164 252 140 32 "Crash-fix loop (dev)"
 $btnFix.Add_Click({ Start-Console ". '.\tools\vsenv.ps1'; & '.\tools\fix_loop.ps1' -Project bioshock2 -GameDir game_bs2 -Look" -Keep })
 $btnHelp = New-Ctl Windows.Forms.Button 312 252 132 32 "In-game keys"
-$btnHelp.Add_Click({ [Windows.Forms.MessageBox]::Show("F9   Cheat panel: god mode, noclip, fly, teleport, game speed, give health / EVE / ammo / plasmids, summon, custom console commands, memory name scanner`nF4   Emulator settings`nF3   Debug overlay`n`nThe panel needs the engine captured first: open and close the pause menu once, and pick up any item once before using Give.`n`nTest cheats on a spare save.", "BioShock 2 Recomp") | Out-Null })
+$btnHelp.Add_Click({ [Windows.Forms.MessageBox]::Show("F9   Cheat panel: god mode, noclip, fly, teleport, game speed, give health / EVE / ammo / plasmids, summon, custom console commands, memory name scanner`nD-pad Left x3   MP weapon wheel (right stick aims, A equips, B cancels; keyboard G)`nF4   Emulator settings`nF3   Debug overlay`n`nThe panel needs the engine captured first: open and close the pause menu once, and pick up any item once before using Give.`n`nTest cheats on a spare save.", "BioShock 2 Recomp") | Out-Null })
 foreach ($b in @($btnBuild, $btnReport, $btnLogs, $btnFix, $btnHelp)) { $b.BackColor = [Drawing.Color]::FromArgb(36, 52, 44) }
 foreach ($b in @($btnPlay, $btnBuild, $btnReport, $btnLogs, $btnFix, $btnHelp)) { $b.FlatStyle = "Flat"; $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(70, 110, 85) }
 foreach ($c in @($cbLook, $cbFps, $cbScale, $tbExp, $tbGam)) { $c.BackColor = [Drawing.Color]::FromArgb(30, 44, 38); $c.ForeColor = $form.ForeColor }
@@ -128,11 +130,11 @@ $btnMp.Add_Click({
     Save-Settings; Set-BotIni
     if (-not (Test-Path $MpExe)) {
         $r = [Windows.Forms.MessageBox]::Show("Multiplayer isn't built yet. Build it now? (10-30 min, needs the single-player build done first)", "BioShock 2 Recomp", "YesNo")
-        if ($r -eq "Yes") { Start-Console "Set-Location '$MpRoot'; & '.\tools\mp_init.ps1' -NoImport" -Keep }
+        if ($r -eq "Yes") { Start-Console "& '.\mp\tools\mp_init.ps1' -NoImport" -Keep }
         return
     }
     $a = (Get-PlayArgs) -replace '^-Project bioshock2 ', '-Project bioshock2mp '
-    Start-Console "Set-Location '$MpRoot'; & '.\tools\play.ps1' $a -Extra '--fake_live_signin=true'"
+    Start-Console "& '.\mp\tools\play.ps1' $a -Extra '--fake_live_signin=true'"
 })
 $cbBots.Add_SelectedIndexChanged({ Save-Settings; Set-BotIni }); $chkHunt.Add_CheckedChanged({ Save-Settings; Set-BotIni })   # live: the game re-reads it every 2 s
 $cbBots.BackColor = [Drawing.Color]::FromArgb(30, 44, 38); $cbBots.ForeColor = $form.ForeColor

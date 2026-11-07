@@ -46,6 +46,11 @@ if (-not $admin) {
 }
 Set-Location $Root
 $t0 = Get-Date
+$InstallLog = Join-Path $Root ("logs\install_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
+New-Item -ItemType Directory (Split-Path $InstallLog) -Force | Out-Null
+try { Start-Transcript -Path $InstallLog -Force | Out-Null } catch {}
+# Any uncaught error (setup.ps1, cmake, git) stops here with a message instead of closing the window.
+trap { Die "Unexpected error: $($_.Exception.Message)`n  Full log: $InstallLog`n  Re-run Install.ps1 after fixing it: finished steps are skipped." }
 
 Step "1. Build tools"
 if ($SkipPrereqs) { Ok "skipped (-SkipPrereqs)" }
@@ -104,12 +109,14 @@ else {
 Step "4. Build (SDK + code generation + compile; 20-60 min the first time)"
 . (Join-Path $Root "tools\vsenv.ps1")
 & (Join-Path $Root "tools\setup.ps1")
+# Pin this repo's SDK: find_package would otherwise take whichever rexglue the CMake package registry lists first.
+$RexCfg = Join-Path $Root ".deps\rexglue-sdk\out\install\win-amd64\lib\cmake\rexglue"
 Push-Location (Join-Path $Root "app")
 try {
     function Run([string[]]$a) { & cmake @a; if ($LASTEXITCODE -ne 0) { throw "cmake $($a -join ' ') failed" } }
-    Run @("--preset", "win-amd64-relwithdebinfo")
+    Run @("--preset", "win-amd64-relwithdebinfo", "-Drexglue_DIR=$RexCfg")
     Run @("--build", "--preset", "win-amd64-relwithdebinfo", "--target", "bioshock2_codegen")
-    Run @("--preset", "win-amd64-relwithdebinfo")   # re-configure: generated sources list only exists after codegen
+    Run @("--preset", "win-amd64-relwithdebinfo", "-Drexglue_DIR=$RexCfg")   # re-configure: generated sources list only exists after codegen
     Run @("--build", "--preset", "win-amd64-relwithdebinfo")
 } catch { Pop-Location; Die "Build failed: $($_.Exception.Message)" }
 Pop-Location

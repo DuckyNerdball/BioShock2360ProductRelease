@@ -192,21 +192,40 @@ void Bs2QueueGive(std::string spec);
 std::atomic<bool> g_auto_a{false};
 std::chrono::steady_clock::time_point g_auto_a_from;   // pad hook presses only after this (the game's tick may stall during the load)
 extern "C" void __imp__sub_822724B8(PPCContext& __restrict ctx, uint8_t* base);
-// Second weapon wheel (weapon_wheel.h): hold D-pad Down -> the overlay wheel opens, the right stick aims it. While held,
-// the game sees neither the button nor the right stick (no camera spin, no D-pad action).
-struct Bs2WheelPad { std::atomic<bool> held{false}; std::atomic<int> rx{0}, ry{0}; };
+// Second weapon wheel (weapon_wheel.h). Hayden 11-07: D-pad Down was in the way -> tap D-pad LEFT 3 times (within
+// 0.9 s) to open it. While open: right stick aims, A or D-pad Left equips, B cancels; the game sees none of those
+// buttons nor the right stick. The first two Left taps still reach the game (we can't know a third is coming).
+struct Bs2WheelPad { std::atomic<bool> held{false}, cancel{false}; std::atomic<int> rx{0}, ry{0}; };
 Bs2WheelPad& Bs2WheelPadState() { static Bs2WheelPad p; return p; }
 static void WheelPadFilter(uint8_t* base, uint32_t st) {
-  constexpr uint16_t kWheelBtn = 0x0002;   // D-pad Down
+  constexpr uint16_t kLeft = 0x0004, kA = 0x1000, kB = 0x2000;
+  using clk = std::chrono::steady_clock;
+  static uint16_t prev = 0;
+  static clk::time_point taps[3];
+  static int ntap = 0;
   uint16_t b = uint16_t(base[st + 4] << 8 | base[st + 5]);
+  const uint16_t pressed = b & ~prev;
+  prev = b;
   auto& w = Bs2WheelPadState();
-  const bool held = (b & kWheelBtn) != 0;
-  if (held != w.held.load()) REXLOG_INFO("bioshock2: wheel: {}", held ? "open (D-pad Down held)" : "closed");
-  w.held = held;
-  if (!held) return;
-  w.rx = int16_t(base[st + 12] << 8 | base[st + 13]); w.ry = int16_t(base[st + 14] << 8 | base[st + 15]);
-  b &= ~kWheelBtn; base[st + 4] = uint8_t(b >> 8); base[st + 5] = uint8_t(b);
-  for (int i = 12; i < 16; ++i) base[st + i] = 0;   // right stick to the wheel, not the camera
+  if (!w.held.load()) {
+    if (pressed & kLeft) {
+      const auto now = clk::now();
+      taps[ntap % 3] = now; ++ntap;
+      if (ntap >= 3 && now - taps[ntap % 3] < std::chrono::milliseconds(900)) {   // oldest of the last three
+        ntap = 0; w.cancel = false; w.held = true;
+        REXLOG_INFO("bioshock2: wheel: open (D-pad Left x3)");
+      }
+    }
+    if (!w.held.load()) return;
+  } else if (pressed & (kA | kLeft | kB)) {
+    if (pressed & kB) w.cancel = true;
+    w.held = false;
+    REXLOG_INFO("bioshock2: wheel: {}", (pressed & kB) ? "cancelled (B)" : "equip");
+  }
+  // open (or closing this frame): hide our buttons and the right stick from the game
+  if (w.held.load()) { w.rx = int16_t(base[st + 12] << 8 | base[st + 13]); w.ry = int16_t(base[st + 14] << 8 | base[st + 15]); }
+  b &= ~(kLeft | kA | kB); base[st + 4] = uint8_t(b >> 8); base[st + 5] = uint8_t(b);
+  for (int i = 12; i < 16; ++i) base[st + i] = 0;
 }
 float Bs2KnobPub(const char* k, float d);   // bridge_loader.cpp (C++ linkage: declared outside the extern "C" hook)
 extern "C" REX_FUNC(sub_822724B8) {

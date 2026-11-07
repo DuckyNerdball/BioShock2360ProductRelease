@@ -4,18 +4,13 @@ Static recomp of `Bioshock2MP_Xenon.xex` from **your own disc**, run **offline o
 AI bots. No Xbox Live, no online services, nothing distributed. This folder holds only our code, scripts and
 config; the game data, dumps, generated C++ and logs stay on your machine and are gitignored.
 
-## Setup (Windows, PowerShell)
-```powershell
-# 1. BS2 single-player recomp already set up next to it (provides game_bs2\ with your disc's files)
-cd E:\Projects\Bioshock2Project
-robocopy bioshock2-recomp\mp bioshock2mp-recomp /E
-cd bioshock2mp-recomp
-.\tools\mp_init.ps1        # junction to ..\bioshock2-recomp\game_bs2, codegen, hook check, build
-.\go                       # build + launch (passes --fake_live_signin=true)
-```
-SDK requirement: ReXGlue SDK 0.10.0 with the `fake_live_signin` cvar (xam_user.cpp) and "unknown XLIVEBASE
-messages succeed" (xlivebase_app.cpp) changes - see `patches\` once added. Without them the front end stops
-at "You must be signed into Xbox LIVE".
+## Setup
+Players: nothing to do - the top-level `Install.ps1` builds this after single player, and the launcher's
+**Play Multiplayer** button runs it (and offers to build it if it is missing). Manual build from this folder,
+after the single-player build: `.\tools\mp_init.ps1 -NoImport`, then `.\go`.
+
+`mp_init` makes `mp\game_bs2` a junction to the repo's `game_bs2\` and uses the repo's patched SDK
+(`patches\rexglue-sdk\0002` adds the `fake_live_signin` cvar the offline front end needs).
 
 ## What it does (mp_src\mp_spawnlog.cpp)
 - Logs the spawn chain, script vocabulary, positions, hits: `logs\mp_spawn.log`, `logs\mp_vocab.tsv`.
