@@ -8,6 +8,25 @@ You build it yourself from **your own** legally dumped BioShock 2 (Xbox 360) dis
 
 <a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
+## What you get that the PC versions don't have
+- **Multiplayer you can play alone, offline.** Private matches against AI bots on the game's own multiplayer maps and
+  modes. The PC original has no bots, and BioShock 2 Remastered has no multiplayer at all. Nothing here connects to
+  Xbox Live or any online service. **Very early alpha:** the bots move, aim and fight, but their AI is still being worked on.
+- **Full multiplayer unlocks without the grind.** One private match against bots takes your profile to rank 40, so
+  every weapon, plasmid and tonic is open. Turn it off with `unlockall=0` in `mp\run\mp_bots.ini`.
+- **Skip the multiplayer intro.** `skipintro=1` in `mp\run\mp_bots.ini` loads the apartment in free roam, without the
+  TV film and guided steps.
+- **Switch between single player and multiplayer from the title screen**, like on the console.
+- **Multiplayer weapons in single player** through a weapon wheel, and an **F9 cheat panel** (god mode, noclip, fly,
+  teleport, game speed, give items, summon).
+- **Picture controls the console never had:** 2x-3x resolution, sharpening, anti-aliasing, 60 fps, and a multiplayer
+  picture setting that removes the bloom haze.
+- **Open and yours to change.** You build it from source, so you can read it, fix it and mod it. No account, no store
+  client.
+
+What the PC versions still do better: higher-resolution textures, native mouse and keyboard menus, and far less setup.
+This is the Xbox 360 game running natively, not a replacement for the PC release.
+
 ## Install (Windows 10/11 x64, ~60 GB free, 1-2 hours the first time)
 1. Download the latest release zip and extract it to a short path (e.g. `C:\Games\bioshock2-recomp`).
 2. Right-click `Install.ps1` > **Run with PowerShell** and pick your disc image (.iso).
