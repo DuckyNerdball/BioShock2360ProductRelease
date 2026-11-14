@@ -17,12 +17,22 @@ You build it yourself from **your own** legally dumped BioShock 2 (Xbox 360) dis
 - **Skip the multiplayer intro.** `skipintro=1` in `mp\run\mp_bots.ini` loads the apartment in free roam, without the
   TV film and guided steps.
 - **Switch between single player and multiplayer from the title screen**, like on the console.
-- **Multiplayer weapons in single player** through a weapon wheel, and an **F9 cheat panel** (god mode, noclip, fly,
-  teleport, game speed, give items, summon).
+- **A cheat panel for the campaign (F9):** god mode, noclip, fly, teleport, game speed, infinite health / EVE / ammo,
+  ADAM and money, every weapon and its upgrades, every plasmid and tonic at any tier, ammo and kits, kill all, summon
+  any class, and custom console commands.
+- **Multiplayer weapons in the campaign** through a weapon wheel.
 - **Picture controls the console never had:** 2x-3x resolution, sharpening, anti-aliasing, 60 fps, and a multiplayer
   picture setting that removes the bloom haze.
 - **Open and yours to change.** You build it from source, so you can read it, fix it and mod it. No account, no store
   client.
+
+### Under the hood
+- **Game logic at 60 fps.** The console ran at 30. Here the game itself ticks at 60, so physics, ragdolls and animation
+  move at the full frame rate, not just the picture. The original 30 is one click away in the launcher.
+- **The console game, not a port of it.** This is the Xbox 360 code recompiled to run natively: the console's
+  controller-first interface and wheels, as the game shipped there.
+- **Changed from inside the engine.** The bots, the unlocks and the cheat panel work by reaching into the running
+  game's own objects and script functions, which is why they don't need modified game files.
 
 What the PC versions still do better: higher-resolution textures, native mouse and keyboard menus, and far less setup.
 This is the Xbox 360 game running natively, not a replacement for the PC release.
