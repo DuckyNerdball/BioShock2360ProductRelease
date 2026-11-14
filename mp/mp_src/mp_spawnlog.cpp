@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -492,7 +493,7 @@ std::vector<std::string> ReadLines(const std::filesystem::path& p) {
 //   preyoff=0    hex offset in ShockMPBotController to force   preyforce=0   1 = write YOUR pawn there, 2 = your controller
 struct BotCfg { int enabled = 1, count = 3, preyscan = 1, preyforce = 0, aimfix = 1, countdown = 0, botdamage = 1, research = 1; double delay = 4, gap = 0.75, aimerror = 3.0, aimz = 20, aimmiss = 10, aimeye = 0;
                 uint32_t preyoff = 0; std::string cmd = "admin DebugAddAIBot"; std::vector<uint32_t> aimoffs{0x494, 0x4B0, 0x5A0, 0xA58};
-                int hunters = 0, spread = 1, unlockall = 0, skipintro = 0; double spreadmin = 600, huntnear = 1200, huntfar = 3000; std::vector<std::string> names; std::vector<uint32_t> huntoffs{0x494, 0x4B0, 0x5A0, 0xA58};
+                int hunters = 0, spread = 1, unlockall = 0, skipintro = 0, profilesave = 1, profileb2 = 0; double spreadmin = 600, huntnear = 1200, huntfar = 3000; std::vector<std::string> names; std::vector<uint32_t> huntoffs{0x494, 0x4B0, 0x5A0, 0xA58};
                 std::vector<std::string> stackfns; };
 BotCfg g_cfg;
 double g_cfg_read = -10;
@@ -525,6 +526,8 @@ void ReadBotCfg() {
     else if (k == "spread") c.spread = std::atoi(v.c_str());
     else if (k == "unlockall") c.unlockall = std::atoi(v.c_str());
     else if (k == "skipintro") c.skipintro = std::atoi(v.c_str());
+    else if (k == "profilesave") c.profilesave = std::atoi(v.c_str());
+    else if (k == "profileb2") c.profileb2 = std::atoi(v.c_str());
     else if (k == "huntnear") c.huntnear = std::atof(v.c_str());
     else if (k == "huntfar") c.huntfar = std::atof(v.c_str());
     else if (k == "names") { size_t i = 0; while (i < v.size()) { size_t j = v.find(',', i); if (j == std::string::npos) j = v.size();
@@ -812,6 +815,20 @@ void PollCommands(PPCContext& ctx, uint8_t* base) {
 }
 }  // namespace
 
+// Title screen "Single Player Game": on a console this starts Bioshock2_Xenon.xex (sub_822D2F58 = XLaunchNewImage(path, flags)).
+// Here single player is a second program, so when bs2start.exe started us (BS2START is set) we close with a code it
+// knows and it opens the single-player build. Without the starter the call goes through as before.
+extern "C" void __imp__sub_822D2F58(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_822D2F58) {
+  static const bool s_starter = std::getenv("BS2START") != nullptr;
+  const char* path = ctx.r3.u32 ? reinterpret_cast<const char*>(base + ctx.r3.u32) : "";
+  if (s_starter && std::strstr(path, "Bioshock2_Xenon.xex")) {
+    REXLOG_INFO("bioshock2mp: Single Player picked - closing so bs2start opens the single-player build");
+    TerminateProcess(GetCurrentProcess(), 0x4251);
+  }
+  __imp__sub_822D2F58(ctx, base);
+}
+
 // ---- bot spawn spread (2026-11-07) ----
 // ShockMPGameInfo.ModifyPlayerPosition(Controller, out vector Location @+4, out rotator Rotation @+0x10) runs in
 // RestartPlayer right before the pawn is placed. All DebugAddAIBot bots got the same spot (441 units from you).
@@ -945,6 +962,79 @@ void StorageProbe(uint8_t* base, const char* when, const std::string& fn, uint32
   }
   std::fflush(g_spawn);
 }
+// ---- profile save-to-disk (11-07) ----
+// The MP profile is Xbox LIVE user storage; offline the download/upload "fail" so every launch starts fresh.
+//   save: UserProfile.ConstructSaveDataBuffer returns the profile as an FString (UTF-16BE text "64\nDefaultProfile\n...");
+//         the upload sends exactly those bytes without the terminator (5342 of 2672 chars, seen in XLIVEBASE 0x5000B).
+//         We write them to run\userdata\DefaultProfile.bin (3 rolling .bak copies).
+//   load: UserProfileManagerXBox.OnReadUserStorageFileComplete is a native event, exec sub_824998C8, parms
+//         {bSuccess bit0 + 2nd bool bit1 packed in the DWORD @+0, TArray<BYTE> Data @+4} (11-07 run 2: writing the
+//         array at +8 crashed in the param copy reading guest 0 = the bools ARE packed, array is at +4).
+//         Pre-call we set bSuccess=1 and hand it the saved bytes in a GMalloc block - what LIVE would have returned.
+//   write: OnWriteUserStorageFileComplete(bSuccess @+0, FString file @+4) - reported as success once the file is on disk.
+std::filesystem::path ProfilePath() { return RunDir() / "userdata" / "DefaultProfile.bin"; }
+bool g_profile_written = false;
+uint32_t GameMalloc(PPCContext& ctx, uint8_t* base, uint32_t size) {
+  uint32_t gm = BE32(base, 0x82F133EC);
+  if (!gm || !Readable(gm, 4)) return 0;
+  uint32_t vt = BE32(base, gm), mfn = Readable(vt + 8, 4) ? BE32(base, vt + 8) : 0;
+  if (mfn < 0x821E0000 || mfn >= 0x82CA2000) return 0;
+  PPCContext saved = ctx;
+  ctx.r3.u64 = gm; ctx.r4.u64 = size; ctx.r5.u64 = 8;
+  REX_CALL_INDIRECT_FUNC(mfn);
+  uint32_t r = ctx.r3.u32;
+  ctx = saved;
+  return (r && Readable(r, size)) ? r : 0;
+}
+void ProfileSave(uint8_t* base, uint32_t parms) {
+  if (!g_cfg.profilesave || !parms || !Readable(parms, 12)) return;
+  uint32_t d = BE32(base, parms), num = BE32(base, parms + 4);
+  if (!d || num < 16 || num > 0x40000 || !Readable(d, num * 2)) return;
+  // sanity: starts with digits then '\n' (version line) - never overwrite a good save with junk
+  if (base[d] != 0 || base[d + 1] < '0' || base[d + 1] > '9') return;
+  uint32_t bytes = (num - 1) * 2;
+  std::error_code ec;
+  auto p = ProfilePath();
+  std::filesystem::create_directories(p.parent_path(), ec);
+  for (int i = 2; i >= 0; --i) {
+    auto from = i ? std::filesystem::path(p.string() + ".bak" + std::to_string(i)) : p;
+    if (std::filesystem::exists(from, ec)) std::filesystem::copy_file(from, p.string() + ".bak" + std::to_string(i + 1), std::filesystem::copy_options::overwrite_existing, ec);
+  }
+  auto tmp = p.string() + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (!f) return;
+  size_t w = std::fwrite(base + d, 1, bytes, f);
+  std::fclose(f);
+  if (w != bytes) return;
+  std::filesystem::rename(tmp, p, ec);
+  if (ec) { std::filesystem::remove(p, ec); std::filesystem::rename(tmp, p, ec); }
+  g_profile_written = !ec;
+  if (g_spawn) { fprintf(g_spawn, "%9.3f  PROFILE saved %u bytes -> %s%s\n", Now(), bytes, p.string().c_str(), ec ? " (FAILED)" : ""); std::fflush(g_spawn); }
+}
+void ProfileLoad(PPCContext& ctx, uint8_t* base, uint32_t parms) {
+  static bool s_done = false;
+  if (!g_cfg.profilesave || s_done || !parms || !Readable(parms, 0x14)) return;
+  s_done = true;
+  if (BE32(base, parms) != 0 || BE32(base, parms + 4) != 0 || BE32(base, parms + 8) != 0) return;   // a real success / data already present: leave it
+  std::error_code ec;
+  auto p = ProfilePath();
+  auto sz = std::filesystem::file_size(p, ec);
+  if (ec || sz < 32 || sz > 0x80000) { if (g_spawn) fprintf(g_spawn, "%9.3f  PROFILE no save on disk (%s) - fresh profile\n", Now(), p.string().c_str()); return; }
+  std::vector<uint8_t> buf(static_cast<size_t>(sz));
+  FILE* f = std::fopen(p.string().c_str(), "rb");
+  if (!f) return;
+  size_t r = std::fread(buf.data(), 1, buf.size(), f);
+  std::fclose(f);
+  if (r != buf.size() || buf[0] != 0 || buf[1] < '0' || buf[1] > '9') { if (g_spawn) fprintf(g_spawn, "%9.3f  PROFILE %s unreadable/corrupt - ignored\n", Now(), p.string().c_str()); return; }
+  uint32_t n = uint32_t(buf.size());
+  uint32_t blk = GameMalloc(ctx, base, n + 2);
+  if (!blk) { if (g_spawn) fprintf(g_spawn, "%9.3f  PROFILE GMalloc failed\n", Now()); return; }
+  std::memcpy(base + blk, buf.data(), n);
+  base[blk + n] = 0; base[blk + n + 1] = 0;
+  W32(base, parms, g_cfg.profileb2 ? 3u : 1u);
+  W32(base, parms + 4, blk); W32(base, parms + 8, n); W32(base, parms + 12, n);
+  if (g_spawn) { fprintf(g_spawn, "%9.3f  PROFILE loaded %u bytes from %s -> data %08X (b2=%d)\n", Now(), n, p.string().c_str(), blk, g_cfg.profileb2); std::fflush(g_spawn); }
+}
 bool ZeroRankTable(uint8_t* base, uint32_t prof) {
   if (!Readable(prof, 0x200)) return false;
   for (uint32_t o = 0x28; o + 12 <= 0x1000; o += 4) {
@@ -975,7 +1065,14 @@ extern "C" REX_FUNC(sub_828209B0) {   // ProcessEvent(this r3, UFunction* r4, Pa
   uint32_t self = ctx.r3.u32, fn = ctx.r4.u32, parms = ctx.r5.u32;
   if (n > kWarmup) {
     PPCContext keep = ctx;
-    if (const Fn* f = Learn(ctx, base, fn)) { if (IsStorageEvent(f->name)) StorageProbe(base, "pre ", f->full, self, parms); OnCall(ctx, base, fn, *f, self, parms, 0, 'E'); }
+    if (const Fn* f = Learn(ctx, base, fn)) {
+      if (IsStorageEvent(f->name)) {
+        if (f->name == "OnReadUserStorageFileComplete" && f->cls == "UserProfileManagerXBox") ProfileLoad(ctx, base, parms);
+        if (f->name == "OnWriteUserStorageFileComplete" && g_profile_written && g_cfg.profilesave && Readable(parms, 4)) W32(base, parms, 1);
+        StorageProbe(base, "pre ", f->full, self, parms);
+      }
+      OnCall(ctx, base, fn, *f, self, parms, 0, 'E');
+    }
     if (t_depth == 0) PollCommands(ctx, base);   // console commands only from a top-level event (game thread, not mid-script)
     ctx = keep;
   }
@@ -1030,13 +1127,24 @@ extern "C" REX_FUNC(sub_828209B0) {   // ProcessEvent(this r3, UFunction* r4, Pa
   if (n > kWarmup && parms) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     auto it = g_fns.find(fn);
-    if (it != g_fns.end() && IsStorageEvent(it->second.name)) StorageProbe(base, "post", it->second.full, self, parms);
+    if (it != g_fns.end() && IsStorageEvent(it->second.name)) {
+      if (it->second.name == "ConstructSaveDataBuffer") ProfileSave(base, parms);
+      StorageProbe(base, "post", it->second.full, self, parms);
+    }
   }
   if (n > kWarmup && g_cfg.unlockall) {
     static std::set<uint32_t> s_done;
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     auto it = g_fns.find(fn);
-    if (it != g_fns.end() && it->second.cls == "UserProfile" && !s_done.count(self) && ZeroRankTable(base, self)) s_done.insert(self);
+    if (it != g_fns.end() && it->second.cls == "UserProfile") {
+      if (!s_done.count(self) && ZeroRankTable(base, self)) s_done.insert(self);
+      // 11-07: with the profile loaded from disk the stored rank (+0x40) comes back from the save AFTER the first
+      // zeroing (loadouts 2/3 showed Locked), and nothing recomputes it before a match ends - keep it pinned at max.
+      else if (s_done.count(self) && Readable(self + 0x40, 4) && BE32(base, self + 0x40) < 40) {
+        if (g_spawn) fprintf(g_spawn, "%9.3f  UNLOCKALL profile %08X rank %u -> 40 (re-pinned)\n", Now(), self, BE32(base, self + 0x40));
+        W32(base, self + 0x40, 40);
+      }
+    }
   }
   // Pawn.EyePosition() returns a vector at parms+0: learn each pawn's eye height (relative or absolute form).
   if (n > kWarmup && parms && Readable(parms, 12) && Readable(self + kLoc, 12)) {

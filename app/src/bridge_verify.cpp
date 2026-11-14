@@ -125,7 +125,12 @@ extern "C" REX_FUNC(sub_82690960) { Hit(16, ctx); __imp__sub_82690960(ctx, base)
 extern "C" void __imp__sub_8270C670(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" REX_FUNC(sub_8270C670) { Hit(17, ctx); __imp__sub_8270C670(ctx, base); }
 extern "C" void __imp__sub_825281F0(PPCContext& __restrict ctx, uint8_t* base);
-extern "C" REX_FUNC(sub_825281F0) { Hit(18, ctx); __imp__sub_825281F0(ctx, base); }
+// anim component Play(ch, FName*, count, mode): fpswap needs a fallback when the MP arms/gun lack the anim BS2 asks for
+bool Bs2FsAnimFallback(PPCContext& ctx, uint8_t* base, uint32_t comp, uint32_t ch, uint32_t names, uint32_t count, uint32_t mode);   // bridge_loader.cpp
+extern "C" REX_FUNC(sub_825281F0) { Hit(18, ctx);
+  const uint32_t comp = ctx.r3.u32, ch = ctx.r4.u32, names = ctx.r5.u32, count = ctx.r6.u32, mode = ctx.r7.u32;
+  __imp__sub_825281F0(ctx, base);
+  if (ctx.r3.u32 == 0) { PPCContext k = ctx; if (Bs2FsAnimFallback(ctx, base, comp, ch, names, count, mode)) { uint32_t r = ctx.r3.u32; ctx = k; ctx.r3.u64 = r; } else ctx = k; } }
 extern "C" void __imp__sub_8268ED08(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" REX_FUNC(sub_8268ED08) { Hit(19, ctx); __imp__sub_8268ED08(ctx, base); }
 extern "C" void __imp__sub_82708A40(PPCContext& __restrict ctx, uint8_t* base);

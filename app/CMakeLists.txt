@@ -33,4 +33,8 @@ if(WIN32)
     target_link_libraries(bioshock2 PRIVATE dbghelp)  # bridge_profile.cpp: stack sampling
 endif()
 
-
+# Starter for RecompLauncher: picks single player (bioshock2.exe) or multiplayer (bioshock2mp.exe). Original code only.
+if(WIN32)
+    add_executable(bs2start WIN32 src/bs2start.cpp)
+    target_link_libraries(bs2start PRIVATE shell32)
+endif()

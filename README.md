@@ -6,6 +6,8 @@ plus **offline multiplayer**: the game's own multiplayer maps and modes in priva
 This repo holds only our own code, scripts and docs. **No game files, no generated code, no executables.**
 You build it yourself from **your own** legally dumped BioShock 2 (Xbox 360) disc image.
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 ## Install (Windows 10/11 x64, ~60 GB free, 1-2 hours the first time)
 1. Download the latest release zip and extract it to a short path (e.g. `C:\Games\bioshock2-recomp`).
 2. Right-click `Install.ps1` > **Run with PowerShell** and pick your disc image (.iso).
@@ -28,6 +30,30 @@ Supported disc: `Bioshock2_Xenon.xex` SHA-1 `b4196d2bd339ff5e80ee1ce9100cb288bac
 - **MP weapon wheel** (single player): tap **D-pad Left 3 times**, aim with the right stick, **A** equips, **B** cancels.
   Keyboard: **G**, then click or press 1-8.
 - F4 emulator settings, F3 debug overlay.
+
+## RecompLauncher
+`recomplauncher.json` describes the built game to [RecompLauncher](https://recomplauncher.com): which copy it needs, how
+it starts, and four settings (resolution, sharpening, anti-aliasing, multiplayer picture). Single player and offline
+multiplayer (private matches against AI bots; it never connects to Xbox Live) are both included: pick **Multiplayer** on
+the title screen to switch to the multiplayer build, and **Single Player Game** there to switch back. Both start through
+`bs2start.exe`, a small starter built with the game that runs the right program.
+
+This project publishes no built game, so RecompLauncher cannot download one. After `Install.ps1` has built your copy:
+
+1. Run `tools\package_local.ps1`. It makes `out\recomplauncher` (run it again after every rebuild).
+2. In RecompLauncher: Settings > Developers > Developer tools > "Add a build" > pick `out\recomplauncher`.
+3. When it asks for your copy of the game, pick your game folder (`game_bs2`). Do not add `game_bs2` as the build.
+
+Multiplayer picture: **Soft glow** keeps the game's bloom at 5% of its original strength; **Clean** removes it. The
+original strength hazes the whole screen at 2x resolution.
+
+RecompLauncher asks for your copy as a **game folder**: the files extracted from your disc image, with
+`Bioshock2_Xenon.xex` at the top. `Install.ps1` already makes it as `game_bs2`. On its own:
+
+```powershell
+.\tools\extract_disc.ps1                                                # asks for the .iso, extracts to .\game_bs2
+.\tools\extract_disc.ps1 -Iso D:\BioShock2.iso -Out D:\Games\BioShock2-360
+```
 
 ## Never share
 Your built `bioshock2.exe` / `bioshock2mp.exe`, `app/generated/`, `mp/app/generated/`, or anything from `game_bs2\`.

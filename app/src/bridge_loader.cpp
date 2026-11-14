@@ -7,6 +7,7 @@
 //              so logging the keys tells us WHY a package was refused.
 // Purpose: find out what happens to a BioShock 1 package (BS1Game.u) dropped into BS2's directory.
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 #include "bioshock2_pch.h"
@@ -850,6 +851,15 @@ std::atomic<int> g_borrow_rank{0};
 std::atomic<uint32_t> g_attached_foreign{0};
 static std::atomic<bool> g_child_req{false};
 std::atomic<uint32_t> g_puppet{0}, g_puppet_arms{0};
+// fpswap (11-08, FP-pass attempt 4): MP meshes on BS2's OWN first-person actors (PlayerHands + the weapon in hand) so
+// they draw in the first-person pass; the world-pass puppets hide and the anim driver targets these two instead.
+std::atomic<uint32_t> g_fs_hands{0}, g_fs_gun{0}, g_fs_hands_comp{0}, g_fs_gun_comp{0};
+// level lifecycle (11-08): section tri counts we zeroed (address of numTris -> original), the brain-hide cache, and a level
+// generation that function-local caches compare against to reset themselves after Bs2MPTeardown.
+static std::map<uint32_t, uint16_t> g_sec_orig, g_hide_orig; static std::map<uint32_t, uint8_t> g_hide_kids; static int g_level_gen = 0;
+static uint32_t g_fs_pprim_arms = 0, g_fs_pprim_gun = 0;
+static uint32_t AnimGunActor() { uint32_t g = g_fs_gun.load(); return g ? g : g_puppet.load(); }
+static uint32_t AnimArmsActor() { uint32_t h = g_fs_hands.load(); return h ? h : g_puppet_arms.load(); }
 static std::atomic<int> g_puppet_event{0};
 void Bs2PuppetCamSnap(PPCContext& ctx, uint8_t* base, uint32_t parms);
 static std::atomic<uint32_t> g_mp_shader{0};   // MP PistolShader (mpres: drawn with RG_Shader's compiled resource)
@@ -860,18 +870,21 @@ struct MPWDef { const char* name; const char* sock; const char* gIdle; const cha
 static const MPWDef kMPW[8] = {
   {"Revolver", "Pistol", "Pistol_Idle", "FireSingle", "FastReload", "Pistol_Idle", "FidgetPistol", "FireSinglePistol", "FastReloadPistol", "EquipPistol", 700, 2600, -2, 3, 4, 0, 0, 6, 14},
   {"Tommy Gun", "TommyGun", nullptr, "Fire", "Reload", "Equip", "FidgetTommygun", "FireTommyGun", "ReloadTommyGun", "EquipTommygun", 140, 2600, -2, 3, 4, 0, 0, 6, 14},
-  {"Shotgun", "Rifle", "SingleFrame", "Fire", "Reload", "SingleFrame", "FidgetShotgun", "FireShotgun", "ReloadShotgun_Start", "EquipShotgun", 900, 1500, -2, 3, -3, 0, 0, 6, 14},
-  {"Grenade Launcher", "Launcher", nullptr, "Fire", "Reload", "Equip", "FidgetLauncher", "FireLauncher", "ReloadLauncher", "EquipLauncher", 900, 2600, -2, 3, 4, 0, 0, 6, 14},
-  {"Crossbow", "Crossbow", "idle", "Fire", "Reload", "idle", "FidgetCrossbow", "FireCrossbow", "ReloadCrossbow", "EquipCrossbow", 900, 2400, -2, 3, 4, 0, 0, 6, 14},
-  {"Nail Gun", "Chem", nullptr, "NailGun_FP_Fire", "NailGun_FP_Reload", "NailGun_FP_Equip", "FidgetNailgun", "FireNailGun", "ReloadNailGun", "EquipNailgun", 120, 2600, -2, 0, 8, -1500, 2500, 6, 14},   // tuned 11-06: barrel pointed forward
-  {"Elephant Gun", "Rifle", nullptr, "HuntingRifle_Fire", "HR_Reload_Rifle", "HuntingRifle_Equip", "EquipHuntingRifle", "HR_Fire", "HR_REload", "EquipHuntingRifle", 1000, 3000, -2, 3, -3, 0, 0, 6, 14},
+  {"Shotgun", "Rifle", "SingleFrame", "Fire", "Reload", "SingleFrame", "FidgetShotgun", "FireShotgun", "ReloadShotgun_Start", "EquipShotgun", 900, 1500, 15, 6, -2, 0, 0, 6, 14},   // 11-08 live-tuned: at pf -2 the right hand sat behind the near plane
+  {"Grenade Launcher", "Launcher", nullptr, "Fire", "Reload", "Equip", "FidgetLauncher", "FireLauncher", "ReloadLauncher", "EquipLauncher", 900, 2600, 20, 5, 0, 0, 0, 6, 14},
+  {"Crossbow", "Crossbow", "idle", "Fire", "Reload", "idle", "FidgetCrossbow", "FireCrossbow", "ReloadCrossbow", "EquipCrossbow", 900, 2400, 28, 5, 0, 0, 0, 6, 14},
+  {"Nail Gun", "Chem", nullptr, "NailGun_FP_Fire", "NailGun_FP_Reload", "NailGun_FP_Equip", "FidgetNailgun", "FireNailGun", "ReloadNailGun", "EquipNailgun", 120, 2600, 22, 4, 4, -1500, 2500, 6, 14},   // tuned 11-06: barrel pointed forward
+  {"Elephant Gun", "Rifle", nullptr, "HuntingRifle_Fire", "HR_Reload_Rifle", "HuntingRifle_Equip", "EquipHuntingRifle", "HR_Fire", "HR_Reload", "EquipHuntingRifle", 1000, 3000, 18, 4, 0, 0, 0, 2, 14},   // 11-08: two-handed - MP left arm (section 2) holds the barrel, keep it; hide only section 1
   {"Wrench", "Wrench", nullptr, nullptr, nullptr, nullptr, "FidgetWrench", nullptr, nullptr, "EquipWrench", 600, 0, -2, 3, 4, 0, 0, 6, 14},
 };
 static std::atomic<int> g_mpw_slot{0};
 // Option A "brains" (Hayden 11-06): each MP gun fires through a BS2 player weapon (real bullets, damage, ammo, HUD);
 // its own FP model is hidden while the MP look is on. Slot 0 keeps the BS1 revolver.
-static const char* kBrain[8] = {"Pistol", "PlayerMachineGun", "PlayerShotgun", "PlayerGrenadeLauncher", "PlayerSpeargun", "PlayerMachineGun", "PlayerSpeargun", nullptr};
-static std::atomic<uint32_t> g_mpw_brain{0}; static std::atomic<bool> g_mpw_look{false}; static std::atomic<int> g_wheel_pending{0};
+static const char* kBrain[8] = {"PlayerRivetGun",   // 11-08: Revolver rides the rivet gun (BS1 pistol brain dropped: it broke level changes)
+                                  "PlayerMachineGun", "PlayerShotgun", "PlayerGrenadeLauncher", "PlayerSpeargun", "PlayerMachineGun", "PlayerSpeargun", nullptr};
+static std::atomic<uint32_t> g_mpw_brain{0}; static std::atomic<bool> g_mpw_look{false};
+static std::atomic<long long> g_mpw_equip_ms{0};   // when the MP wheel last asked for an Equip (switch in flight)
+static long long Bs2NowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); } static std::atomic<int> g_wheel_pending{0};
 uint32_t Bs2MPWBrain() { return g_mpw_look.load() ? g_mpw_brain.load() : 0; }
 static std::vector<uint32_t> g_mpw_shaders; static uint32_t g_rg_shader = 0;   // every MP weapon shader on mpres (game thread only)   // which MP weapon the puppets are showing
 static std::atomic<int> g_wheel_req{0};
@@ -949,6 +962,12 @@ static uint32_t ActorPropOffset(PPCContext& ctx, uint8_t* base, const char* name
   cache[name] = off; return off;
 }
 static void MakeGhost(PPCContext& ctx, uint8_t* base, uint32_t a) {   // no collision, no physics, no shadow: a pure visual
+  if (Bs2Variant("noghost")) return;   // level-crash bisect
+  // 11-08: SetCollision(false,false,false) FIRST - it takes the actor out of the collision hash. Clearing bCollideActors
+  // by hand left the summoned actor hashed; the engine only unhashes actors with bCollideActors set, so the destroyed
+  // puppet stayed in the hash as a dangling pointer -> use-after-free during the next map load (level-change crash).
+  { uint8_t pr[16] = {}; PPCContext k = ctx; uint32_t fn = Bs2CallParms(ctx, base, a, "Engine.Actor", "SetCollision", pr, 16); ctx = k;
+    REXLOG_INFO("bioshock2: mp: MakeGhost {:08X}: SetCollision(false,false,false) fn {:08X}", a, fn); }
   for (const char* b : {"bCollideActors", "bBlockActors", "bBlockPlayers", "bCollideWorld", "bProjTarget", "bBlockZeroExtentTraces", "bBlockNonZeroExtentTraces",
                         "bCastShadowMapShadow", "bCastSimpleShadow", "bCastStaticShadow"}) SetActorProp(ctx, base, a, b, 0);
   SetActorProp(ctx, base, a, "Physics", 0);
@@ -1484,12 +1503,15 @@ static void LoadMPMesh(PPCContext& ctx, uint8_t* base) {
           if (o && Bs2ClassNameOf(ctx, base, o) == cn) { if (best) g_puppet_arms = best; best = o; bi = i; bc = cn; }
         } }
       REXLOG_INFO("bioshock2: mp: puppet {}{} -> {:08X} mesh {:08X} DrawType {} +780 {:08X}", bc, bi, best, best ? BE32(base, best + 300) : 0, best ? base[best + 157] : 0, best ? BE32(base, best + 780) : 0);
+      if (best && Bs2Variant("pupnone")) { REXLOG_INFO("bioshock2: mp: pupnone - summoned puppets left untouched (level-crash bisect)"); g_puppet_arms = 0; best = 0; }
       if (best) {
         uint32_t pm = Bs2Variant("puparms") && g_mp_arms.load() ? g_mp_arms.load() : m;
+        if (!Bs2Variant("nopupmesh")) {   // level-crash bisect
         ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = best; ctx.r4.u64 = pm; __imp__sub_824DDCD8(ctx, base); ctx = k;
         if (base[best + 157] != 2) { ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = best; ctx.r4.u64 = 2; __imp__sub_82378F10(ctx, base); ctx = k; }
         RefreshMeshInstance(ctx, base, best, "puppet");
-        { ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = best; ctx.r4.u64 = 0x104; __imp__sub_82376340(ctx, base); ctx = k; }
+        if (!Bs2Variant("nopupanim")) { ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = best; ctx.r4.u64 = 0x104; __imp__sub_82376340(ctx, base); ctx = k; }
+        }
         REXLOG_INFO("bioshock2: mp: puppet {:08X} carries {:08X} '{}': player {:08X} comp {:08X} DrawType {}", best, pm, Bs2NameOf(ctx, base, pm), BE32(base, best + 1044), BE32(base, best + 1056), base[best + 157]);
         g_puppet = best; if (!g_anim_actor.load()) g_anim_actor = best;
         MakeGhost(ctx, base, best);   // was: shadow bit only; the arm puppet still collided with the player (run 106)
@@ -1501,7 +1523,7 @@ static void LoadMPMesh(PPCContext& ctx, uint8_t* base) {
             REXLOG_INFO("bioshock2: mp: {} off +{:X} words: puppet {:08X} pawn {:08X} rivet {:08X}", pn, off, BE32(base, best + off), pawn ? BE32(base, pawn + off) : 0, g_rivet_actor.load() ? BE32(base, g_rivet_actor.load() + off) : 0); }
         }
         if (uint32_t pa = g_puppet_arms.load(); pa && Bs2Variant("puparms")) {
-          uint32_t am = LoadMPArmsMesh(ctx, base, (uint32_t)Bs2Knob("armsidx", 16053));
+          uint32_t am = Bs2Variant("noarmsload") ? 0 : LoadMPArmsMesh(ctx, base, (uint32_t)Bs2Knob("armsidx", 16053));
           if (am && !Bs2Variant("noarmtex")) {   // MP arm shader draws white here: its params onto a working SP shader (the revolver trick)
             auto find = [&](const char* nm) { uint32_t sp5 = (ctx.r1.u32 - 0x8000) & ~0xFu, str = sp5 + 0x2000; PutWide(base, str, nm);
               ctx.r1.u64 = sp5; ctx.r3.u64 = 0; ctx.r4.u64 = 0xFFFFFFFFu; ctx.r5.u64 = str; ctx.r6.u64 = 0; __imp__sub_828D2190(ctx, base); uint32_t o = ctx.r3.u32; ctx = k; return o; };
@@ -1523,11 +1545,19 @@ static void LoadMPMesh(PPCContext& ctx, uint8_t* base) {
             if (src && host && Bs2ClassNameOf(ctx, base, src) == "Shader") { std::memcpy(base + host + 0xB0, base + src + 0xB0, 0xB0); PutBE32Pub(base, mats, host);
               REXLOG_INFO("bioshock2: mp: arm material {} '{}' params -> host {} {:08X}", src, Bs2NameOf(ctx, base, src), Bs2NameOf(ctx, base, host), host); }
             else REXLOG_INFO("bioshock2: mp: arm material: src {:08X} {} host {:08X} - not swapped", src, src ? Bs2ClassNameOf(ctx, base, src) : "-", host);
+            // 11-08: the LEFT arm (sections 1-2, material slots 1-2 = MP 'BathyPilotLeftArm') drew solid black with its own
+            // MP shader resource. Point those slots at the same textured host (right-arm texture: same suit, close enough).
+            if (uint32_t h0 = BE32(base, mats); h0 && !Bs2Variant("noleftarmtex") && BE32(base, h0 + 0x10) != g_mp_linker.load()) {
+              const uint32_t nm = BE32(base, am + 0xA8);
+              for (uint32_t i = 1; i < nm && i < 8; ++i) { const uint32_t m = BE32(base, mats + 4 * i);
+                if (m && m != h0 && Bs2Readable(m, 0x40) && BE32(base, m + 0x10) == g_mp_linker.load()) {
+                  PutBE32Pub(base, mats + 4 * i, h0); REXLOG_INFO("bioshock2: mp: arm material slot {} '{}' -> host {:08X} (left arm was black)", i, Bs2NameOf(ctx, base, m), h0); } } }
           }
-          if (am) { g_mp_arms = am; ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = pa; ctx.r4.u64 = am; __imp__sub_824DDCD8(ctx, base); ctx = k;
+          if (am && Bs2Variant("nopupmesh")) { g_mp_arms = am; MakeGhost(ctx, base, pa); REXLOG_INFO("bioshock2: mp: nopupmesh - arms puppet {:08X} left bare", pa); }
+          else if (am) { g_mp_arms = am; ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = pa; ctx.r4.u64 = am; __imp__sub_824DDCD8(ctx, base); ctx = k;
             if (base[pa + 157] != 2) { ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = pa; ctx.r4.u64 = 2; __imp__sub_82378F10(ctx, base); ctx = k; }
             RefreshMeshInstance(ctx, base, pa, "puppet-arms");
-            { ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = pa; ctx.r4.u64 = 0x104; __imp__sub_82376340(ctx, base); ctx = k; }
+            if (!Bs2Variant("nopupanim")) { ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = pa; ctx.r4.u64 = 0x104; __imp__sub_82376340(ctx, base); ctx = k; }
             uint8_t pr[16] = {}; Bs2CallParms(ctx, base, pa, "Engine.Actor", "SetCollision", pr, 16);
             MakeGhost(ctx, base, pa);
             REXLOG_INFO("bioshock2: mp: arms puppet {:08X} carries {:08X}: player {:08X}", pa, am, BE32(base, pa + 1044));
@@ -1699,7 +1729,119 @@ static uint32_t PlayMPAnim(PPCContext& ctx, uint8_t* base, uint32_t actor, const
   return r;
 }
 
+extern "C" void __imp__sub_825281F0(PPCContext& __restrict ctx, uint8_t* base);
+// fpswap: BS2 script plays its own anims on PlayerHands (plasmid idles: Ability.GetIdlingAnim) and on the weapon, then
+// FinishAnimation. A name the MP mesh lacks never starts -> FinishAnimation returns at once -> the state loop never
+// yields (hang 11-08: ElectroBoltMasterAbility idle loop). Play the MP weapon's idle on that channel instead, so the
+// latent wait has something to wait for. Missing names are logged (first 60) to build a real plasmid remap.
+bool Bs2FsAnimFallback(PPCContext& ctx, uint8_t* base, uint32_t comp, uint32_t ch, uint32_t names, uint32_t count, uint32_t mode) {
+  static thread_local bool busy = false;
+  if (busy || !comp || (comp != g_fs_hands_comp.load() && comp != g_fs_gun_comp.load())) return false;
+  const bool hands = comp == g_fs_hands_comp.load();
+  const MPWDef& d = kMPW[g_mpw_slot.load() & 7];
+  const char* sub = hands ? (d.aIdle ? d.aIdle : "FidgetPistol") : (d.gIdle ? d.gIdle : d.gEquip);
+  { static int n = 0; if (++n <= 60) { std::string nm = names && Bs2Readable(names, 8) ? Bs2FNameAt(ctx, base, names) : "?";
+      REXLOG_INFO("bioshock2: fpswap: {} lacks anim '{}' (ch {} n {} mode {}) -> '{}'", hands ? "MP arms" : "MP gun", nm, ch, count, mode, sub ? sub : "-"); } }
+  if (!sub) return false;
+  busy = true;
+  uint32_t sp = (ctx.r1.u32 - 0x6000) & ~0xFu, fn = sp + 0x100, str = sp + 0x200; PPCContext k = ctx;
+  PutWide(base, str, sub); std::memset(base + fn, 0, 16);
+  ctx.r1.u64 = sp; ctx.r3.u64 = fn; ctx.r4.u64 = str; ctx.r5.u64 = 1; ctx.r6.u64 = 1; __imp__sub_828D8CA8(ctx, base); ctx = k;
+  ctx.r1.u64 = sp; ctx.r3.u64 = comp; ctx.r4.u64 = ch; ctx.r5.u64 = fn; ctx.r6.u64 = 1; ctx.r7.u64 = mode;
+  __imp__sub_825281F0(ctx, base);
+  busy = false;
+  return true;
+}
+// fpswap: script asks e.g. Ability.GetIdlingAnim for a name, plays it on PlayerHands, then FinishAnimation. Called by the
+// CallFunction hook AFTER any '*.Get*Anim*' function while fpswap is on: replace the returned FName (Result r5, 8 bytes)
+// with an anim the MP arms really have, so the latent wait is real. Every distinct (fn, original anim) is logged once.
+bool Bs2FsActive() { return g_fs_hands.load() != 0; }
+void Bs2FsAnimResult(PPCContext& ctx, uint8_t* base, const std::string& fn, uint32_t self, uint32_t result) {
+  static int dbg = 0; const bool d = ++dbg <= 8;
+  if (d) REXLOG_INFO("bioshock2: fpswap: getter {} self {:08X} result {:08X} hands {:08X} readable {}", fn, self, result, g_fs_hands.load(), result && Bs2Readable(result, 8));
+  // Result usually lives on the guest stack (0x70000000+), which Bs2Readable (heap page cache) reports as unreadable
+  const bool ok = result && ((result >= 0x70000000u && result < 0x80000000u) || Bs2Readable(result, 8));
+  if (!g_fs_hands.load() || !ok) return;
+  // only ability (plasmid) anim getters: a blanket '*Get*Anim*' rule also caught PlayerController camera-anim getters
+  // (rotations/vectors, not names) - writing an FName there would corrupt the camera.
+  const bool ability = fn.rfind("Ability.", 0) == 0;
+  if (!ability && fn.rfind("PlayerWeapon.", 0) != 0 && fn.rfind("Weapon.", 0) != 0) return;
+  const std::string orig = "?";
+  const std::string cls = Bs2ClassNameOf(ctx, base, self);
+  if (!ability) {   // weapon getters: '...HandsAnim' -> MP arm anim, else MP gun anim; kind by keyword
+    const MPWDef& d = kMPW[g_mpw_slot.load() & 7];
+    const bool hands = fn.find("Hands") != std::string::npos;
+    const auto has = [&](const char* w) { return fn.find(w) != std::string::npos; };
+    const char* sub = nullptr;
+    if (has("Fire") || has("Shoot")) sub = hands ? d.aFire : d.gFire;
+    else if (has("Reload")) sub = hands ? d.aReload : d.gReload;
+    else if (has("Equip")) sub = hands ? d.aEquip : d.gEquip;      // Unequip too: no MP lower anim per weapon
+    else sub = hands ? d.aIdle : (d.gIdle ? d.gIdle : d.gEquip);   // Idling / Fidget / anything else
+    if (!sub) return;
+    { static std::set<std::string> seen; if (seen.insert(cls + "|" + fn).second && seen.size() < 200) REXLOG_INFO("bioshock2: fpswap: {} on {} -> '{}'", fn, cls, sub); }
+    uint32_t sp = (ctx.r1.u32 - 0x6000) & ~0xFu, fnm = sp + 0x100, str = sp + 0x200; PPCContext k = ctx;
+    PutWide(base, str, sub); std::memset(base + fnm, 0, 16);
+    ctx.r1.u64 = sp; ctx.r3.u64 = fnm; ctx.r4.u64 = str; ctx.r5.u64 = 1; ctx.r6.u64 = 1; __imp__sub_828D8CA8(ctx, base); ctx = k;
+    std::memcpy(base + result, base + fnm, 8);
+    return;
+  }
+  static const std::pair<const char*, const char*> kMap[] = {   // BS2 ability class (substring) -> MP arms anim family
+    {"ElectroBolt", "ElectrokineticBolt"}, {"Incinerat", "Incineration"}, {"InsectSwarm", "InsectSwarm"}, {"Telekines", "ElectrokineticBolt"},
+    {"WinterBlast", "ElectrokineticBolt"}, {"Cyclone", "ElectrokineticBolt"}, {"Decoy", "ElectrokineticBolt"}, {"Hypnot", "ElectrokineticBolt"}};
+  std::string fam = "ElectrokineticBolt";
+  for (auto& [k, v] : kMap) if (cls.find(k) != std::string::npos) { fam = v; break; }
+  std::string sub = fam + "_Fidget";
+  if (fn.find("Equip") != std::string::npos) sub = fam + (fn.find("Unequip") != std::string::npos ? "_Unequip" : "_Equip");
+  else if (fn.find("Fire") != std::string::npos || fn.find("Attack") != std::string::npos) sub = fam + "_Fire";
+  { static std::set<std::string> seen; std::string key = cls + "|" + fn + "|" + orig;
+    if (seen.insert(key).second && seen.size() < 200) REXLOG_INFO("bioshock2: fpswap: {} on {:08X} {} returned '{}' -> '{}'", fn, self, cls, orig, sub); }
+  uint32_t sp = (ctx.r1.u32 - 0x6000) & ~0xFu, fnm = sp + 0x100, str = sp + 0x200; PPCContext k = ctx;
+  PutWide(base, str, sub); std::memset(base + fnm, 0, 16);
+  ctx.r1.u64 = sp; ctx.r3.u64 = fnm; ctx.r4.u64 = str; ctx.r5.u64 = 1; ctx.r6.u64 = 1; __imp__sub_828D8CA8(ctx, base); ctx = k;
+  std::memcpy(base + result, base + fnm, 8);
+  if (d) REXLOG_INFO("bioshock2: fpswap: getter {} '{}' -> '{}' ({:08X} {:08X})", fn, orig, sub, BE32(base, result), BE32(base, result + 4));
+}
+// fpswap (11-08): the FP pass draws a render primitive that caches {+0x04 mesh, +0x40 mesh instance, +0x48 instance+0x38}
+// (found by scanning for the hands' instance: block at 4C6E4B64 had PH_Mesh at +4, SkeletalMeshInstance77 at +0x40).
+// SetMesh / a rebuilt instance never reach it, so patch it. Signature scan of the heap: word == inst and word-0x3C == mesh.
+static uint32_t FindMeshPrimitive(uint8_t* base, uint32_t mesh, uint32_t inst, uint32_t actor) {
+  // the actor itself matches too (Mesh +0x12C, instance +0x168 = same 0x3C apart): skip it
+  for (uint32_t c = 0x40000000u; c < 0x50000000u; c += 0x10000) { if (!Bs2Readable(c, 0x10000)) continue;
+    for (uint32_t o = 0x40; o < 0x10000; o += 4) { const uint32_t p = c + o - 0x40;
+      if (BE32(base, c + o) == inst && BE32(base, c + o - 0x3C) == mesh && !(p >= actor && p < actor + 0x1000)) return p; } }
+  return 0;
+}
+// 11-08 level-change fix: GObjLoaded = TArray<UObject*> at 0x83004D58 {data, num, max} (EndLoad sub_828C6548 copies,
+// empties, sorts and processes it). Our MP/BS1 loads call CreateExport/Preload directly and never run EndLoad, so their
+// objects (arm shaders, skeleton/anim metadata... 731 of them) sat in it until the next map load, when the engine had
+// already detached/freed those linkers -> crashes in the sort and in EndLoad. Drop entries owned by our foreign linkers
+// every tick (we PostLoad them ourselves). Cheap: the list is empty almost always.
+static void PurgeForeignFromLoaded(uint8_t* base) {
+  const uint32_t ta = 0x83004D58u, ml = g_mp_linker.load(), bl = g_bs1_linker.load();
+  if (!ml && !bl) return;   // ta is in the XEX data section (always mapped; Bs2Readable only knows the heap)
+  const uint32_t data = BE32(base, ta), num = BE32(base, ta + 4);
+  { static auto lastl = std::chrono::steady_clock::now(); if (std::chrono::steady_clock::now() - lastl > std::chrono::seconds(5)) { lastl = std::chrono::steady_clock::now();
+      static int c = 0; if (++c <= 40) { std::string w; for (uint32_t i = 0; i < num && i < 4 && Bs2Readable(data + 4 * i, 4); ++i) { uint32_t o = BE32(base, data + 4 * i); char b[48];
+          snprintf(b, sizeof b, "%08X(l %08X f %08X) ", o, o >= 0x30000000u && Bs2Readable(o, 0x40) ? BE32(base, o + 0x10) : 0, o >= 0x30000000u && Bs2Readable(o, 0x40) ? BE32(base, o + 0x34) : 0); w += b; }
+        REXLOG_INFO("bioshock2: GObjLoaded num {} max {} (MP linker {:08X}) first: {}", num, BE32(base, ta + 8), ml, w); } } }
+  if (!data || !num || num > 4000000 || !Bs2Readable(data, 4) || !Bs2Readable(data + (num - 1) * 4, 4)) return;
+  uint32_t w = 0;
+  for (uint32_t i = 0; i < num; ++i) { const uint32_t o = BE32(base, data + 4 * i);
+    const uint32_t l = (o >= 0x30000000u && o < 0x80000000u && Bs2Readable(o, 0x20)) ? BE32(base, o + 0x10) : 0;
+    if (l && (l == ml || l == bl)) continue;
+    PutBE32Pub(base, data + 4 * w++, o); }
+  if (w != num) { PutBE32Pub(base, ta + 4, w); static int k = 0; if (++k <= 30) REXLOG_INFO("bioshock2: GObjLoaded: dropped {} foreign of {} pending objects", num - w, num); }
+}
+void Bs2Heartbeat(); void Bs2HangArm(bool);   // crash_trace.cpp: hang watchdog
 void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
+  Bs2Heartbeat();
+  PurgeForeignFromLoaded(base);
+  // 11-08 level-change fix #2: BioShock persists a level's state when you leave it (save-like). The puppets went into
+  // that state with their MP meshes, so re-entering loaded BS1MP through the engine's own (incompatible) path -> crash.
+  // RF_Transient (0x4000, object flags +0x34) keeps them out of every save.
+  if (!Bs2Variant("notrans")) for (uint32_t a : {g_puppet.load(), g_puppet_arms.load()}) if (a && Bs2Readable(a, 0x40) && !(BE32(base, a + 0x34) & 0x4000u)) {
+    PutBE32Pub(base, a + 0x34, BE32(base, a + 0x34) | 0x4000u);
+    static int k = 0; if (++k <= 8) REXLOG_INFO("bioshock2: puppet {:08X} marked RF_Transient (flags now {:08X})", a, BE32(base, a + 0x34)); }
   // stutter checkpoints: per-section time of this tick, logged when the tick runs long
   struct CP { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now(), last = t0; std::string w;
     void mark(const char* n) { auto now = std::chrono::steady_clock::now(); double ms = std::chrono::duration<double, std::milli>(now - last).count(); last = now;
@@ -1710,8 +1852,9 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
   if (auto it = g_live_knobs.find("quit"); it != g_live_knobs.end() && it->second == 1.0f) { REXLOG_INFO("bioshock2: knobs: quit=1 - exiting"); std::exit(0); }
   // Section hiding (live knobs hidearm=<bitmask>, hideph=<bitmask>): LOD0 (+0xC0) -> sections (+0, count +4), 20-byte
   // entries {u16 material, ..., u16 firstTri @16, u16 numTris @18}. numTris = 0 hides that section; originals kept.
-  { static std::map<uint32_t, uint16_t> orig;   // address of the numTris field -> original value
+  { auto& orig = g_sec_orig;   // address of the numTris field -> original value (file scope: restored at teardown)
     auto apply = [&](uint32_t mesh, uint32_t mask, const char* tag) {
+      if (Bs2Variant("nohide")) return;
       if (!mesh || !Bs2Readable(mesh, 0xC8)) return; uint32_t lods = BE32(base, mesh + 0xC0), nl = BE32(base, mesh + 0xC4);
       uint32_t stride = 0;   // LOD element stride: next copy of the LOD vtable word (820A6230 at +0x18)
       for (uint32_t o = 0x20; o < 0x400; o += 4) if (BE32(base, lods + 0x18 + o) == 0x820A6230u) { stride = o; break; }
@@ -1721,8 +1864,9 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
         for (uint32_t i = 0; i < ns && i < 16; ++i) { uint32_t f = sec + i * 20 + 18;
           if (!orig.count(f)) orig[f] = (uint16_t)(base[f] << 8 | base[f + 1]);
           uint16_t v = (mask >> i) & 1 ? 0 : orig[f]; base[f] = uint8_t(v >> 8); base[f + 1] = uint8_t(v); }
-        REXLOG_INFO("bioshock2: mp: {} LOD{} (stride {:#x}) sections {} hide mask {:#x}", tag, li, stride, ns, mask); } };
+        { static int hl = 0; if (++hl <= 40) REXLOG_INFO("bioshock2: mp: {} LOD{} (stride {:#x}) sections {} hide mask {:#x}", tag, li, stride, ns, mask); } } };
     static uint32_t s_ha = 0xFFFFFFFF, s_hp = 0xFFFFFFFF;
+    { static int gen = 0; if (gen != g_level_gen) { gen = g_level_gen; s_ha = s_hp = 0xFFFFFFFF; } }
     if (g_reapply_hide) { g_reapply_hide = false; s_ha = s_hp = 0xFFFFFFFF; }   // SetDrawType rebuilt the proxies: write the masks again
     const bool armsmode = g_puppet_arms.load() != 0;   // defaults: hide Delta right arm + drill/rivet parts (sections 1,2,3), MP left arm side (1,2)
     const MPWDef& dw = kMPW[g_mpw_slot.load() & 7];
@@ -1731,7 +1875,8 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
     if (hp != s_hp) { uint32_t h = g_rivet_hands.load();
       if (!h) if (uint32_t rv = g_rivet_actor.load()) { uint32_t b = BE32(base, rv + 0xAC); if (b && Bs2ClassNameOf(ctx, base, b) == "PlayerHands") g_rivet_hands = h = b; }
       if (!h) s_hp = hp;   // nothing to hide yet; don't retry every tick
-      if (h) { s_hp = hp; uint32_t hm = BE32(base, h + 300);
+      if (h && BE32(base, h + 300) == g_mp_arms.load()) s_hp = hp;   // fpswap: hands carry the MP arms - Delta masks don't apply
+      else if (h) { s_hp = hp; uint32_t hm = BE32(base, h + 300);
         static bool dumped = false; if (!dumped) { dumped = true; uint32_t mat = BE32(base, hm + 0xA4), nmat = BE32(base, hm + 0xA8); std::string w;
           for (uint32_t i = 0; i < nmat && i < 12; ++i) w += Bs2NameOf(ctx, base, BE32(base, mat + 0x30 * i)) + " ";
           uint32_t lod = BE32(base, hm + 0xC0), sec = BE32(base, lod), ns = BE32(base, lod + 4); std::string w2;
@@ -1741,6 +1886,7 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
     // Partial section: knobs <x>s=<section> <x>f=<first tri offset> <x>n=<tri count> for x = ph (Delta) / am (MP arms):
     // draws only tris [first+f, first+f+n) of that section, to find where one hand ends inside a shared section.
     auto partial = [&](const char* x, uint32_t mesh) {
+      if (Bs2Variant("nohide")) return;
       static std::map<std::string, std::tuple<int, int, int>> last; std::string ks = std::string(x) + "s", kf = std::string(x) + "f", kn = std::string(x) + "n";
       int sec = (int)Bs2Knob(ks.c_str(), -1), f = (int)Bs2Knob(kf.c_str(), 0), n = (int)Bs2Knob(kn.c_str(), -1);
       auto cur = std::make_tuple(sec, f, n); if (last[x] == cur || !mesh) return; last[x] = cur;
@@ -1768,23 +1914,40 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
     if (wo) {
       uint32_t cur = BE32(base, pawn + wo); const uint32_t br = g_mpw_brain.load();
       if (bs1 && cur == bs1 && kBrain[g_mpw_slot.load() & 7] && std::string(kBrain[g_mpw_slot.load() & 7]) != "Pistol") g_mpw_slot = 0;   // revolver picked elsewhere
-      if (g_mpw_look.load() && cur && cur != br && cur != bs1) g_mpw_look = false;   // switched away (BS2 wheel): native look back
+      // switched away with BS2's own wheel -> native look back. NOT while an MP-wheel Equip is in flight: Equip is async,
+      // the old weapon stays current for ~0.5 s, and dropping the look there let the native Big Daddy machine gun show
+      // up when going Crossbow -> Tommy Gun (Hayden 11-08). Grace: 4 s or until the target is in hand.
+      const bool switching = br && cur != br && Bs2NowMs() - g_mpw_equip_ms.load() < 4000;
+      if (g_mpw_look.load() && cur && cur != br && cur != bs1 && !switching) g_mpw_look = false;
       bool show = cur && ((bs1 && cur == bs1) || (g_mpw_look.load() && cur == br));
       { // hide the brain's own first-person model (all mesh sections) while the MP look rides it; restore otherwise
-        static std::map<uint32_t, uint16_t> orig; static uint32_t hidden = 0;
-        const uint32_t want = (show && cur != bs1) ? cur : 0;
-        if (want != hidden) {
-          auto secs = [&](uint32_t actor, bool hide) { uint32_t mesh = actor ? BE32(base, actor + 300) : 0; if (!mesh || !Bs2Readable(mesh, 0xC8)) return;
+        auto& orig = g_hide_orig; static uint32_t hidden = 0, s_hold = 0;
+        { static int gen = 0; if (gen != g_level_gen) { gen = g_level_gen; hidden = 0; s_hold = 0; } }
+        uint32_t want = (show && cur != bs1) ? cur : 0;
+        // 11-08 (Hayden: "the Big Daddy weapon shows for a moment or two"): don't wait for the async Equip to finish.
+        // Hide the brain the moment the MP wheel picks it, and a freshly given brain as soon as it is in hand.
+        if (!want && !Bs2Variant("latehide")) {
+          // a give in flight first: g_mpw_brain still names the PREVIOUS brain then (run 11-08 14:38: Shotgun give hid the
+          // old Tommy brain and the new shotgun showed for 1.2 s until the retry)
+          if (const int wp = g_wheel_pending.load(); wp >= 1 && wp <= 7) {
+            if (cur && cur != bs1 && kBrain[wp - 1] && Bs2ClassNameOf(ctx, base, cur) == kBrain[wp - 1]) want = cur; }
+          else if (g_mpw_look.load() && br && switching && Bs2Readable(br, 0x200)) want = br;
+        }
+        auto secs = [&](uint32_t actor, bool hide) { if (Bs2Variant("nohide")) return; uint32_t mesh = actor ? BE32(base, actor + 300) : 0; if (!mesh || !Bs2Readable(mesh, 0xC8)) return;
             uint32_t lods = BE32(base, mesh + 0xC0), nl = BE32(base, mesh + 0xC4), stride = 0;
             for (uint32_t o = 0x20; o < 0x400; o += 4) if (Bs2Readable(lods + 0x18 + o, 4) && BE32(base, lods + 0x18 + o) == 0x820A6230u) { stride = o; break; }
             for (uint32_t li = 0; li < nl && li < 6; ++li) { if (li && !stride) break; uint32_t lod = lods + li * stride, sec = BE32(base, lod), ns = BE32(base, lod + 4);
               for (uint32_t i = 0; i < ns && i < 32; ++i) { uint32_t f = sec + i * 20 + 18; if (!orig.count(f)) orig[f] = uint16_t(base[f] << 8 | base[f + 1]);
                 uint16_t v = hide ? 0 : orig[f]; base[f] = uint8_t(v >> 8); base[f + 1] = uint8_t(v); } } };
-          secs(hidden, false); secs(want, true);
+        if (want != hidden) {
+          // MP -> MP switch: the old brain is still in hand (lowering) - keep it hidden until the switch is done (s_hold)
+          const bool holdold = switching && hidden && cur == hidden && want && want != hidden;
+          if (holdold) { if (s_hold && s_hold != hidden) secs(s_hold, false); s_hold = hidden; } else secs(hidden, false);
+          secs(want, true);
           { // its attachments (ammo drum, upgrade mods...) hang off it with Base == weapon: DrawType 0 while hidden
-            static std::map<uint32_t, uint8_t> kids; PPCContext k2 = ctx;
-            for (auto& [a, dt] : kids) if (Bs2Readable(a, 0x200)) { ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = dt; __imp__sub_82378F10(ctx, base); ctx = k2; }
-            kids.clear();
+            auto& kids = g_hide_kids; PPCContext k2 = ctx;
+            if (!holdold) { for (auto& [a, dt] : kids) if (Bs2Readable(a, 0x200)) { ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = dt; __imp__sub_82378F10(ctx, base); ctx = k2; }
+              kids.clear(); }
             uint32_t lvl = BE32(base, pawn + 256), arr = lvl ? BE32(base, lvl + 0x3C) : 0, n = lvl ? BE32(base, lvl + 0x40) : 0;
             if (want && arr && n < 200000 && Bs2Readable(arr, n * 4))
               for (uint32_t i = 0; i < n; ++i) { uint32_t a = BE32(base, arr + 4 * i); if (!a || !Bs2Readable(a, 0x200) || BE32(base, a + 0xAC) != want || (base[a + 157] != 2 && base[a + 157] != 8)) continue;   // meshes only: keep muzzle flash/light/smoke
@@ -1796,6 +1959,12 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
             uint32_t wm = want ? BE32(base, want + 300) : 0;
             REXLOG_INFO("bioshock2: mpw: hands mesh '{}' sections {} | brain mesh '{}' Base {:08X}", hm ? Bs2NameOf(ctx, base, hm) : "-", w, wm ? Bs2NameOf(ctx, base, wm) : "-", want ? BE32(base, want + 0xAC) : 0); }
           hidden = want; }
+        if (s_hold && !switching && s_hold != hidden) {   // switch finished: the old brain's model back (it is holstered now)
+          secs(s_hold, false); PPCContext k2 = ctx;
+          for (auto it = g_hide_kids.begin(); it != g_hide_kids.end();) { const uint32_t a = it->first;
+            if (Bs2Readable(a, 0x200) && BE32(base, a + 0xAC) != hidden) { ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = it->second; __imp__sub_82378F10(ctx, base); ctx = k2; it = g_hide_kids.erase(it); }
+            else ++it; }
+          REXLOG_INFO("bioshock2: mpw: switch done - old brain {:08X} model restored", s_hold); s_hold = 0; }
         // attachments spawn a moment AFTER the equip (VisibleAmmoModel, mods): keep catching new ones while hidden
         static auto lastk = std::chrono::steady_clock::now();
         if (hidden && std::chrono::steady_clock::now() - lastk > std::chrono::milliseconds(500)) { lastk = std::chrono::steady_clock::now();
@@ -1805,6 +1974,7 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
               ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = 0; __imp__sub_82378F10(ctx, base); ctx = k2;
               REXLOG_INFO("bioshock2: mpw: hid late brain attachment {} '{}'", Bs2ClassNameOf(ctx, base, a), Bs2NameOf(ctx, base, a)); } } }
       static int s_show = -1;
+      { static int gen = 0; if (gen != g_level_gen) { gen = g_level_gen; s_show = -1; } }
       if ((int)show != s_show) { s_show = show;
         PPCContext k = ctx;
         for (uint32_t a : {g_puppet.load(), g_puppet_arms.load()}) if (a) { ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = show ? 2 : 0; __imp__sub_82378F10(ctx, base); ctx = k; }
@@ -2033,9 +2203,9 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
     if (t != lt) { lt = t; uint32_t co = ActorPropOffset(ctx, base, "Controller"), c = co && co < 0x2000 ? BE32(base, pw + co) : 0;
       if (c && Bs2Readable(c, 0x200)) { PutBE32Pub(base, c + 0x1EC, BE32(base, c + 0x1EC) + int32_t(t)); PutBE32Pub(base, pw + 0x1EC, BE32(base, pw + 0x1EC) + int32_t(t)); }
       REXLOG_INFO("bioshock2: test: turn {} (controller {:08X})", t, c); } }
-  if (static bool once = false; !once && g_mp_arms.load() && g_puppet.load() && (Bs2Variant("mpall") || Bs2Variant("puparms") || Bs2Knob("mpall", 0) != 0)) { once = true; MPWeaponsProbe(ctx, base); }
+  if (static bool once = false; !once && !Bs2Variant("noprobe") && g_mp_arms.load() && g_puppet.load() && (Bs2Variant("mpall") || Bs2Variant("puparms") || Bs2Knob("mpall", 0) != 0)) { once = true; MPWeaponsProbe(ctx, base); }
   // live: gunmesh=N puts MP weapon N (0 = revolver) on the gun puppet; arms socket list logged once (gunbone=<idx>)
-  if (uint32_t pp = g_puppet.load(), am = g_mp_arms.load(); pp && am) {
+  if (uint32_t pp = g_puppet.load(), am = g_mp_arms.load(); pp && am && !Bs2Variant("nopupmesh")) {
     static bool socks = false; if (!socks) { socks = true; uint32_t arr = BE32(base, am + 0xE4), n = BE32(base, am + 0xE8); std::string l;
       for (uint32_t i = 0; i < n && i < 64; ++i) l += FNameIdxStr(ctx, base, BE32(base, arr + 8 * i), BE32(base, arr + 8 * i + 4)) + "=" + std::to_string(BE32(base, arr + 8 * i)) + " ";
       REXLOG_INFO("bioshock2: mpw: arms sockets: {}", l); }
@@ -2056,6 +2226,174 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
         REXLOG_INFO("bioshock2: mpw: gun puppet -> slot {} mesh {:08X} '{}'", gm, mm, Bs2NameOf(ctx, base, mm));
         const MPWDef& d = kMPW[gm]; uint32_t pa = g_puppet_arms.load();
         if (d.gEquip) PlayMPAnim(ctx, base, pp, d.gEquip, 0, 0); if (pa && d.aEquip) PlayMPAnim(ctx, base, pa, d.aEquip, 0, 0); } } }
+  // ---- fpswap=1: first-person pass via BS2's own FP actors (attempt 4, 11-08) ----
+  // 11-06 run 62: MP arms on PlayerHands with NO anim player hung PlayerHands' script; the arms anim system now builds
+  // fine on the puppet (MP anim set preloaded by the puppet path), so retry on PlayerHands once the puppets are up.
+  // Steps: SetMesh(hands, MP arms) -> refresh -> anim system (must get a player at +1044, else restore at once);
+  // SetMesh(weapon in hand, MP gun for the wheel slot) -> refresh -> anim system -> AttachToBone(hands, weapon, socket);
+  // puppets DrawType 0; anim driver retargets (AnimGunActor/AnimArmsActor). fpswap=0 puts everything back.
+  {
+    static int s_fs = 0; static uint32_t s_h = 0, s_w = 0, s_hm = 0, s_wm = 0, s_hfl = 0;
+    static uint32_t s_hprim = 0, s_wprim = 0, s_hinst = 0, s_winst = 0;   // FP render primitives + original instances (fsmode 32)
+    const int fs = (int)Bs2Knob("fpswap", 0);
+    // fsmode bits (live, 11-08): 1 = SetMesh only (no mesh-instance rebuild / SetDrawType proxy rebuild - PlayerHands is
+    // DrawType 0 and drawn by the FP pass, so "rebuild via SetDrawType(0)" took it out of the scene), 2 = rebuild the
+    // mesh instance (82374780) but no SetDrawType, 4 = no anim-system rebuild
+    const int fsmode = (int)Bs2Knob("fsmode", 1);
+    auto setmesh = [&](uint32_t a, uint32_t m, const char* tag) {
+      uint32_t prim = 0;
+      if (fsmode & 32) { const uint32_t om = BE32(base, a + 300), oi = BE32(base, a + 0x168);
+        uint32_t& cache = (a == s_h || a == g_rivet_hands.load()) ? s_hprim : s_wprim;
+        if (cache && Bs2Readable(cache, 0x50) && BE32(base, cache + 0x40) == oi) prim = cache; else prim = cache = FindMeshPrimitive(base, om, oi, a);
+        REXLOG_INFO("bioshock2: fpswap: {} FP primitive {:08X} (mesh {:08X} inst {:08X})", tag, prim, om, oi); }
+      PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = m;
+      __imp__sub_824DDCD8(ctx, base); ctx = k;
+      // fsmode 8 (11-08): keep the ORIGINAL mesh instance (the FP pass only draws that one - a rebuilt instance vanishes)
+      // but point it at the new mesh: instance +0x3C = mesh. fsmode 1 alone left +0x3C on Delta's PH_Mesh, so Delta's
+      // arm was skinned with the MP skeleton's 50 bones (the blue mess). 16 = also copy +0x20 and +0xAC from a fresh
+      // instance of the new mesh (the arm puppet's), in case they are mesh-derived (section count / bounds).
+      if (fsmode & 8) { uint32_t inst = BE32(base, a + 0x168);
+        if (inst && Bs2Readable(inst, 0x100)) { uint32_t was = BE32(base, inst + 0x3C); PutBE32Pub(base, inst + 0x3C, m);
+          if (fsmode & 16) if (uint32_t pa = g_puppet_arms.load(); pa && m == g_mp_arms.load()) { uint32_t pi = BE32(base, pa + 0x168);
+            if (pi && Bs2Readable(pi, 0x100)) { PutBE32Pub(base, inst + 0x20, BE32(base, pi + 0x20)); PutBE32Pub(base, inst + 0xAC, BE32(base, pi + 0xAC)); } }
+          REXLOG_INFO("bioshock2: fpswap: {} instance {:08X} mesh {:08X} -> {:08X} (+20 {:08X})", tag, inst, was, m, BE32(base, inst + 0x20)); } }
+      if (fsmode & 2) { ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; __imp__sub_82374780(ctx, base); ctx = k; }
+      else if (!(fsmode & 1)) RefreshMeshInstance(ctx, base, a, tag);
+      if (prim) { const uint32_t ni = BE32(base, a + 0x168);
+        PutBE32Pub(base, prim + 0x04, m); PutBE32Pub(base, prim + 0x40, ni); if (ni) PutBE32Pub(base, prim + 0x48, ni + 0x38);
+        REXLOG_INFO("bioshock2: fpswap: {} primitive {:08X} patched: mesh {:08X} inst {:08X}", tag, prim, m, ni);
+        Bs2DumpObject(ctx, base, (std::string("fsprim-") + tag).c_str(), prim, 0x80); }
+      REXLOG_INFO("bioshock2: fpswap: {} SetMesh {:08X} -> {:08X} (fsmode {}) DrawType {} inst {:08X}", tag, a, m, fsmode, base[a + 157], BE32(base, a + 0x168)); };
+    auto animsys = [&](uint32_t a, uint32_t fl) { if (fsmode & 4) return BE32(base, a + 1044); PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = fl; __imp__sub_82376340(ctx, base); ctx = k; return BE32(base, a + 1044); };
+    auto drawtype = [&](uint32_t a, uint32_t dt) { if (!a || base[a + 157] == dt) return; PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = dt; __imp__sub_82378F10(ctx, base); ctx = k; };
+    auto restore = [&](const char* why) {
+      if (s_h && s_hm) { setmesh(s_h, s_hm, "fpswap restore hands"); animsys(s_h, s_hfl ? s_hfl : 0x104); if (base[s_h + 157] != 2) drawtype(s_h, 2); }
+      if (s_w && s_wm) { setmesh(s_w, s_wm, "fpswap restore gun"); animsys(s_w, 0x104); }
+      g_fs_hands = 0; g_fs_gun = 0; g_fs_hands_comp = 0; g_fs_gun_comp = 0; drawtype(g_puppet.load(), 2); drawtype(g_puppet_arms.load(), 2);
+      REXLOG_INFO("bioshock2: fpswap: restored ({}) hands {:08X} gun {:08X}", why, s_h, s_w); s_h = s_w = s_hm = s_wm = 0; };
+    uint32_t pawn = Bs2PlayerPawn(), w = pawn ? BE32(base, pawn + 0x6F4) : 0;
+    if (fs != s_fs) {
+      s_fs = fs;
+      if (s_h || s_w) restore("knob");
+      Bs2HangArm(fs != 0);
+      if (fs == 1) {
+        uint32_t h = (w && Bs2Readable(w, 0xB0)) ? BE32(base, w + 0xAC) : 0, am = g_mp_arms.load(), slot = (uint32_t)g_mpw_slot.load() & 7;
+        if (fsmode & 32) if (uint32_t pa = g_puppet_arms.load(), pg = g_puppet.load(); pa && base[pa + 157] == 2) {   // world puppets' primitives (valid MP render data) while still in the scene
+          g_fs_pprim_arms = FindMeshPrimitive(base, BE32(base, pa + 300), BE32(base, pa + 0x168), pa);
+          g_fs_pprim_gun = pg ? FindMeshPrimitive(base, BE32(base, pg + 300), BE32(base, pg + 0x168), pg) : 0;
+          REXLOG_INFO("bioshock2: fpswap: puppet primitives arms {:08X} gun {:08X}", g_fs_pprim_arms, g_fs_pprim_gun);
+          if (g_fs_pprim_arms) Bs2DumpObject(ctx, base, "fsprim-puparms", g_fs_pprim_arms, 0x80); }
+        uint32_t mm = slot == 0 ? g_mp_mesh.load() : g_mpw_mesh[slot].load();
+        std::string hc = h ? Bs2ClassNameOf(ctx, base, h) : "-";
+        REXLOG_INFO("bioshock2: fpswap: try - weapon {:08X} {} Base {:08X} {} | MP arms {:08X} | slot {} {} mesh {:08X}", w, w ? Bs2ClassNameOf(ctx, base, w) : "-", h, hc, am, slot, kMPW[slot].name, mm);
+        if (!w || !h || hc != "PlayerHands" || !am || !mm) REXLOG_INFO("bioshock2: fpswap: blocked by missing piece (need weapon in hand on PlayerHands, MP arms, slot mesh)");
+        else {
+          s_h = h; s_hm = BE32(base, h + 300); s_hfl = BE32(base, h + 1020); s_w = w; s_wm = BE32(base, w + 300);
+          setmesh(h, am, "fpswap hands");
+          // fsflags (live): anim-system flags for the hands. 0 = PlayerHands' own (+1020, 0x4 = BS2's FP anim tree built for
+          // Delta's skeleton - suspect for the 11-08 distortion), e.g. 260 = 0x104 = what the (correct-looking) puppets use
+          const uint32_t ff = (uint32_t)Bs2Knob("fsflags", 0);
+          uint32_t hp = animsys(h, ff ? ff : (s_hfl ? s_hfl : 0x104));
+          REXLOG_INFO("bioshock2: fpswap: hands {:08X} mesh {:08X} -> MP arms {:08X}; anim player {:08X} (flags {:#x}, used {:#x}) comp +1056 {:08X}", h, s_hm, am, hp, s_hfl, ff ? ff : (s_hfl ? s_hfl : 0x104), BE32(base, h + 1056));
+          if (!hp) restore("hands got no anim player - would hang PlayerHands' script");
+          else {
+            setmesh(w, mm, "fpswap gun");
+            uint32_t gp = animsys(w, 0x104);
+            uint32_t arr = BE32(base, am + 0xE4), n = BE32(base, am + 0xE8), sk = 0;
+            for (uint32_t i = 0; i < n && i < 64; ++i) if (FNameIdxStr(ctx, base, BE32(base, arr + 8 * i), BE32(base, arr + 8 * i + 4)) == kMPW[slot].sock) { sk = BE32(base, arr + 8 * i); break; }
+            if (sk) { PPCContext k = ctx; uint32_t sp = (ctx.r1.u32 - 0x3000) & ~0xFu, nm = sp + 0x800; PutBE32Pub(base, nm, sk); PutBE32Pub(base, nm + 4, 0);
+              ctx.r1.u64 = sp; ctx.r3.u64 = h; ctx.r4.u64 = w; ctx.r5.u64 = nm; __imp__sub_82372168(ctx, base); ctx = k; }
+            { PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = h; __imp__sub_8236DD60(ctx, base); g_fs_hands_comp = ctx.r3.u32; ctx = k;
+              ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = w; __imp__sub_8236DD60(ctx, base); g_fs_gun_comp = ctx.r3.u32; ctx = k; }
+            { static bool dumped = false; if (!dumped) { dumped = true; uint32_t arr = BE32(base, am + 0x2BC), cnt = BE32(base, am + 0x2C0); std::string w2;
+                for (uint32_t i = 0; i < cnt && i < 2048; ++i) { uint32_t o = BE32(base, arr + 4 * i); if (!o || !Bs2Readable(o, 0x20)) continue;
+                  std::string nm = Bs2NameOf(ctx, base, o); if (nm.rfind("USharedSkeletonAnimationMetadata_", 0) == 0) nm = nm.substr(33); w2 += nm + " ";
+                  if (w2.size() > 1500) { REXLOG_INFO("bioshock2: fpswap: MP arm anims: {}", w2); w2.clear(); } }
+                if (!w2.empty()) REXLOG_INFO("bioshock2: fpswap: MP arm anims: {}", w2); } }
+            g_fs_hands = h; g_fs_gun = w; drawtype(g_puppet.load(), 0); drawtype(g_puppet_arms.load(), 0);
+            REXLOG_INFO("bioshock2: fpswap: ON - gun {:08X} mesh {:08X} -> {:08X} anim player {:08X}, socket '{}' ({}) Base now {:08X}; puppets hidden",
+                        w, s_wm, mm, gp, kMPW[slot].sock, sk, BE32(base, w + 0xAC));
+          }
+        }
+      }
+    }
+    { static float ld = 0; float dk = Bs2Knob("fsdump", 0);   // fsdump=N: dump mesh instances (+0x168) hands / gun / arm puppet for diffing
+      if (dk != ld) { ld = dk; if (dk > 0) { uint32_t h = s_h ? s_h : g_rivet_hands.load(), pa = g_puppet_arms.load();
+        for (auto [tag, a] : {std::pair<const char*, uint32_t>{"hands", h}, {"gun", s_w}, {"armpuppet", pa}}) if (a) {
+          uint32_t inst = BE32(base, a + 0x168);
+          REXLOG_INFO("bioshock2: fsdump {} actor {:08X} mesh {:08X} inst {:08X} DrawType {} +C8 {:08X} +408 {:08X}", tag, a, BE32(base, a + 300), inst, base[a + 157], BE32(base, a + 0xC8), BE32(base, a + 0x408));
+          if (inst && Bs2Readable(inst, 0x200)) Bs2DumpObject(ctx, base, (std::string("fsdump-inst-") + tag).c_str(), inst, 0x200); } } } }
+    { // fsor / fsand (live, 11-08): OR / AND-NOT bits into the hands' (and gun's, fsgun=1) mesh instance +0x20. Delta's FP
+      // instance has 0x4E, a rebuilt one 0x65, the world puppet's 0x5D: bit 0x02 is only on the FP one (suspect FP flag).
+      static uint32_t lo = 0, la = 0, lg = 0; const uint32_t o = (uint32_t)Bs2Knob("fsor", 0), an = (uint32_t)Bs2Knob("fsand", 0), gg = (uint32_t)Bs2Knob("fsgun", 0);
+      if ((o != lo || an != la || gg != lg) && s_h) { lo = o; la = an; lg = gg;
+        for (uint32_t a : {s_h, gg ? s_w : 0u}) if (a) { uint32_t inst = BE32(base, a + 0x168);
+          if (inst && Bs2Readable(inst, 0x40)) { uint32_t was = BE32(base, inst + 0x20), now = (was | o) & ~an; PutBE32Pub(base, inst + 0x20, now);
+            REXLOG_INFO("bioshock2: fpswap: inst {:08X} (+3C mesh {:08X}) +20 {:08X} -> {:08X}", inst, BE32(base, inst + 0x3C), was, now); } } } }
+    { // fsmat=1 (live, 11-08): give the MP arms (and MP gun, fsgun=1) Delta's PH_Mesh material 0 in every slot - if they then
+      // draw in the FP pass, the FP pass rejects the MP materials (missing FP shader variant), not the mesh. 0 restores.
+      static float lm = 0; static std::vector<std::pair<uint32_t, uint32_t>> saved; const float fm = Bs2Knob("fsmat", 0);
+      if (fm != lm) { lm = fm;
+        for (auto [a, v] : saved) PutBE32Pub(base, a, v); saved.clear();
+        uint32_t ph = s_hm ? s_hm : (g_rivet_hands.load() ? BE32(base, g_rivet_hands.load() + 300) : 0);
+        uint32_t phm = ph ? BE32(base, ph + 0xA4) : 0, phmat = phm && Bs2Readable(phm, 4) ? BE32(base, phm) : 0;
+        if (fm > 0 && phmat) for (uint32_t m : {g_mp_arms.load(), Bs2Knob("fsgun", 0) != 0 && s_w ? BE32(base, s_w + 300) : 0u}) if (m) {
+          uint32_t ma = BE32(base, m + 0xA4), mn = BE32(base, m + 0xA8); std::string w;
+          for (uint32_t i = 0; i < mn && i < 16; ++i) { uint32_t slot = ma + 0x30 * i; if (!Bs2Readable(slot, 4)) break;
+            w += Bs2NameOf(ctx, base, BE32(base, slot)) + " "; saved.push_back({slot, BE32(base, slot)}); PutBE32Pub(base, slot, phmat); }
+          REXLOG_INFO("bioshock2: fpswap: fsmat mesh {:08X} {} slots ({}) -> Delta material {:08X} '{}'", m, mn, w, phmat, Bs2NameOf(ctx, base, phmat)); }
+        else REXLOG_INFO("bioshock2: fpswap: fsmat {} (restored {} slots, Delta material {:08X})", fm, saved.size(), phmat); } }
+    { // fsscan=N (live, 11-08): who else holds a pointer to the hands' mesh instance (+0x168)? Scan 0x40000000-0x50000000 in
+      // readable 64 KB chunks for the current instance address and the one PlayerHands had at spawn (g_fs_hinst0).
+      static float ls = 0; const float sk = Bs2Knob("fsscan", 0); static uint32_t hinst0 = 0;
+      if (uint32_t h = g_rivet_hands.load(); h && !hinst0) hinst0 = BE32(base, h + 0x168);
+      if (sk != ls) { ls = sk; if (sk > 0) { uint32_t h = s_h ? s_h : g_rivet_hands.load(); const uint32_t cur = h ? BE32(base, h + 0x168) : 0;
+        std::string hits; int n = 0;
+        for (uint32_t c = 0x40000000u; c < 0x50000000u && n < 60; c += 0x10000) { if (!Bs2Readable(c, 0x10000)) continue;
+          for (uint32_t o = 0; o < 0x10000; o += 4) { uint32_t v = BE32(base, c + o); if ((v == cur || v == hinst0) && v) { char b[48]; snprintf(b, sizeof b, "%08X=%s ", c + o, v == cur ? "cur" : "orig"); hits += b; if (++n >= 60) break; } } }
+        REXLOG_INFO("bioshock2: fsscan hands {:08X} inst cur {:08X} orig {:08X}: {}", h, cur, hinst0, hits);
+        // fsscan=3: repoint every outside reference to the ORIGINAL instance at the current one (skip the original's own
+        // memory: +0xC4 self pointer). The FP pass keeps drawing whatever these hold. Log 32 words around each.
+        if (sk >= 3 && cur && cur != hinst0) for (uint32_t c = 0x40000000u; c < 0x50000000u; c += 0x10000) { if (!Bs2Readable(c, 0x10000)) continue;
+          for (uint32_t o = 0; o < 0x10000; o += 4) { uint32_t a = c + o; if (BE32(base, a) != hinst0 || (a >= hinst0 && a < hinst0 + 0x400)) continue;
+            Bs2DumpObject(ctx, base, "fsscan-ref", (a - 0x40) & ~3u, 0x80); PutBE32Pub(base, a, cur);
+            REXLOG_INFO("bioshock2: fsscan repointed {:08X}: {:08X} -> {:08X}", a, hinst0, cur); } } } } }
+    { // fscopy=<bitmask of word indices 0..31> (live): copy those words of the arm puppet's primitive into the hands' FP
+      // primitive (and gun puppet -> gun with fsgun=1). Originals saved; 0 restores.
+      static uint32_t lc = 0; static std::vector<std::pair<uint32_t, uint32_t>> sv; const uint32_t cm = (uint32_t)Bs2Knob("fscopy", 0);
+      if (cm != lc) { lc = cm; for (auto [a, v] : sv) PutBE32Pub(base, a, v); sv.clear();
+        auto cp2 = [&](uint32_t dst, uint32_t src, const char* t) { if (!dst || !src) return; std::string w;
+          for (int i = 0; i < 32; ++i) if (cm & (1u << i)) { sv.push_back({dst + 4 * i, BE32(base, dst + 4 * i)}); PutBE32Pub(base, dst + 4 * i, BE32(base, src + 4 * i)); char b[24]; snprintf(b, sizeof b, "+%02X ", i * 4); w += b; }
+          REXLOG_INFO("bioshock2: fpswap: fscopy {} {:08X} <- {:08X}: {}", t, dst, src, w); };
+        if (cm) { cp2(s_hprim, g_fs_pprim_arms, "hands"); if (Bs2Knob("fsgun", 0) != 0) cp2(s_wprim, g_fs_pprim_gun, "gun"); } } }
+    { // fspup=N (live, 11-08): FP draw for the WORLD puppets themselves. Primitive +0x34 top byte: hands 0x01, FP gun 0x01,
+      // puppet 0x00 -> suspect depth-priority group (foreground). Set it to N on both puppet primitives (found by signature,
+      // re-found if their instance changed); fspup=0 restores the saved word. Puppets must be visible (fpswap=0).
+      static float lp = 0; static uint32_t pa_prim = 0, pg_prim = 0, pa_was = 0, pg_was = 0; const float pk = Bs2Knob("fspup", 0);
+      if (pk != lp) { lp = pk; const uint32_t pa = g_puppet_arms.load(), pg = g_puppet.load();
+        if (pa_prim) PutBE32Pub(base, pa_prim + 0x34, pa_was); if (pg_prim) PutBE32Pub(base, pg_prim + 0x34, pg_was);
+        pa_prim = pa ? FindMeshPrimitive(base, BE32(base, pa + 300), BE32(base, pa + 0x168), pa) : 0;
+        pg_prim = pg ? FindMeshPrimitive(base, BE32(base, pg + 300), BE32(base, pg + 0x168), pg) : 0;
+        if (pa_prim) pa_was = BE32(base, pa_prim + 0x34); if (pg_prim) pg_was = BE32(base, pg_prim + 0x34);
+        if (pk > 0) { const uint32_t v = uint32_t(pk) & 0xFF;
+          if (pa_prim) PutBE32Pub(base, pa_prim + 0x34, (pa_was & 0x00FFFFFFu) | (v << 24)); if (pg_prim) PutBE32Pub(base, pg_prim + 0x34, (pg_was & 0x00FFFFFFu) | (v << 24));
+          if (Bs2Knob("fspupre", 1) != 0) {   // the group is probably read when the primitive enters the scene: re-add, re-find, re-apply
+            for (uint32_t a : {pa, pg}) if (a && base[a + 157]) { PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = base[a + 157]; __imp__sub_82378F10(ctx, base); ctx = k; }
+            uint32_t na = pa ? FindMeshPrimitive(base, BE32(base, pa + 300), BE32(base, pa + 0x168), pa) : 0, ng = pg ? FindMeshPrimitive(base, BE32(base, pg + 300), BE32(base, pg + 0x168), pg) : 0;
+            REXLOG_INFO("bioshock2: fspup re-add: arms prim {:08X} -> {:08X} (+34 {:08X}) gun prim {:08X} -> {:08X} (+34 {:08X})", pa_prim, na, na ? BE32(base, na + 0x34) : 0, pg_prim, ng, ng ? BE32(base, ng + 0x34) : 0);
+            if (na) { pa_prim = na; PutBE32Pub(base, na + 0x34, (BE32(base, na + 0x34) & 0x00FFFFFFu) | (v << 24)); }
+            if (ng) { pg_prim = ng; PutBE32Pub(base, ng + 0x34, (BE32(base, ng + 0x34) & 0x00FFFFFFu) | (v << 24)); } } }
+        REXLOG_INFO("bioshock2: fspup {} arms prim {:08X} +34 {:08X} -> {:08X} | gun prim {:08X} +34 {:08X} -> {:08X}", pk, pa_prim, pa_was, pa_prim ? BE32(base, pa_prim + 0x34) : 0,
+                    pg_prim, pg_was, pg_prim ? BE32(base, pg_prim + 0x34) : 0); } }
+    if (s_h || s_w) {   // keep it honest: weapon changed / actors gone -> put things back
+      if (!pawn || w != s_w) restore("weapon in hand changed");
+      else { drawtype(g_puppet.load(), 0); drawtype(g_puppet_arms.load(), 0);
+        if (Bs2Knob("fsforce", 0) != 0 && base[s_h + 157] != 2) { REXLOG_INFO("bioshock2: fpswap: hands DrawType {} -> 2 (fsforce)", base[s_h + 157]); drawtype(s_h, 2); }
+        static auto lastlog = std::chrono::steady_clock::now(); if (std::chrono::steady_clock::now() - lastlog > std::chrono::seconds(3)) { lastlog = std::chrono::steady_clock::now();
+          REXLOG_INFO("bioshock2: fpswap: tick hands LRT {:08X} DrawType {} mesh {:08X} | gun LRT {:08X} DrawType {} mesh {:08X} Base {:08X}", BE32(base, s_h + 0x130), base[s_h + 157], BE32(base, s_h + 300),
+                      BE32(base, s_w + 0x130), base[s_w + 157], BE32(base, s_w + 300), BE32(base, s_w + 0xAC)); } }
+    }
+  }
   { static float lastw = 0; float w = Bs2Knob("wheel", 0); if (w != lastw) { lastw = w; if (w > 0) g_wheel_req = int(w); } }
   if (int r = g_wheel_req.exchange(0)) WheelEquip(ctx, base, r);
   else if (int p = g_wheel_pending.load()) { static auto t0 = std::chrono::steady_clock::now(); static int lp = 0;
@@ -2104,7 +2442,17 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
       if (std::abs(dp) < 4000 && std::abs(dy) < 4000) { rp += int32_t(dp * rlead); ry += int32_t(dy * rlead); } }
     // knobs: forward/right/up offset in view space, extra rotation
     const bool am_ = g_puppet_arms.load() != 0;   // MP arm holds the gun: tuned live 11-06 (run 95)
-    float fwd = Bs2Knob("pf", am_ ? -2 : 55), rgt = Bs2Knob("pr", am_ ? 3 : 23), up = Bs2Knob("pu", am_ ? 4 : -18);   // arms: pulled back/right per Hayden (run 101)   // tuned live 11-06 (revolver over Delta's right hand)
+    float fwd = Bs2Knob("pf", am_ ? -2 : 55), rgt = Bs2Knob("pr", am_ ? 3 : 23), up = Bs2Knob("pu", am_ ? 4 : -18);
+    // fpscale (11-08): anti-clip without a first-person pass. Shrink the puppets around the eye: DrawScale s and the
+    // camera-space offset * s -> the same picture on screen (perspective is scale-invariant about the eye), but the
+    // models only reach s * their size forward, inside the pawn's collision radius, so walls can't cut them.
+    const float fps_ = Bs2Knob("fpscale", 0.35f);
+    if (fps_ > 0.01f && fps_ < 1.0f) { fwd *= fps_; rgt *= fps_; up *= fps_; }
+    { static float ls = -1; if (fps_ != ls) { ls = fps_; const uint32_t dso = ActorPropOffset(ctx, base, "DrawScale");
+        for (uint32_t a : {pp, g_puppet_arms.load()}) if (a && dso && dso < 0x1000) { PutF(base, a + dso, fps_ > 0.01f ? fps_ : 1.0f);
+          if (base[a + 157]) { PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = base[a + 157]; __imp__sub_82378F10(ctx, base); ctx = k; } }
+        g_reapply_hide = true;
+        REXLOG_INFO("bioshock2: fpscale {} (DrawScale @+{:X}) on gun {:08X} arms {:08X}", fps_, dso, pp, g_puppet_arms.load()); } }   // arms: pulled back/right per Hayden (run 101)   // tuned live 11-06 (revolver over Delta's right hand)
     double yaw = ry * 3.14159265358979 / 32768.0, pit = rp * 3.14159265358979 / 32768.0;
     float fx = float(std::cos(pit) * std::cos(yaw)), fy = float(std::cos(pit) * std::sin(yaw)), fz = float(std::sin(pit));
     float rx = float(-std::sin(yaw)), ryv = float(std::cos(yaw));
@@ -2130,7 +2478,10 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
     }
     // Puppets vanish away from spawn (run 108): the scene keeps the bounds it computed at Add time, so once the camera can't
     // see the spawn spot the renderer culls them. Re-add (SetDrawType = scene Remove + Add) each time they travel rpd units.
-    if (float thr = Bs2Knob("rpd", 96); thr > 0) {
+    // 11-08: with fpscale the cached bounds shrink with the model (0.35 -> ~1/3), so a 96-unit refresh let the gun fall
+    // out of its stale bounds and flicker while walking (Hayden). Refresh distance scales with fpscale.
+    const float rps_ = Bs2Knob("fpscale", 0.35f), rpsc = (rps_ > 0.01f && rps_ < 1.0f) ? rps_ : 1.0f;
+    if (float thr = Bs2Knob("rpd", 96) * rpsc * Bs2Knob("rpdk", 0.8f); thr > 0) {
       static float ax = 0, ay = 0, az = 0; static bool have = false;
       const float px = GBF(pl), py = GBF(pl + 4), pz = GBF(pl + 8), dx = px - ax, dy = py - ay, dz = pz - az;
       if (!have || dx * dx + dy * dy + dz * dz > thr * thr) { have = true; ax = px; ay = py; az = pz;
@@ -2153,9 +2504,10 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
   if (uint32_t pw = g_attached_foreign.load(); pw && Bs2Variant("child")) { static int c = 0; if (++c % 60 == 0 && c <= 600) REXLOG_INFO("bioshock2: mp: child pistol LRT {:08X} Base {:08X}", BE32(base, pw + 0x130), BE32(base, pw + 0xAC)); }
   // Event-driven puppet anims (default): the BS1 pistol's own script (fire / reload / equip, via Bs2PuppetEvent from the
   // CallFunction hook) picks the MP anims; otherwise idle. animmode=2 = the old demo cycle.
-  if (uint32_t pp = g_puppet.load(); pp && g_puppet_arms.load() && Bs2Knob("animmode", 0) != 2) {
-    uint32_t pa = g_puppet_arms.load(); auto now = std::chrono::steady_clock::now();
+  if (uint32_t pp = AnimGunActor(); pp && AnimArmsActor() && Bs2Knob("animmode", 0) != 2) {
+    uint32_t pa = AnimArmsActor(); auto now = std::chrono::steady_clock::now();
     static auto busy_until = now; static bool idle_set = false;
+    { static uint32_t s_pp = 0, s_pa = 0; if (s_pp != pp || s_pa != pa) { s_pp = pp; s_pa = pa; idle_set = false; } }   // retargeted (fpswap): restart idle
     if (int ev = g_puppet_event.exchange(0)) {
       const MPWDef& d = kMPW[g_mpw_slot.load() & 7];
       const char* g = d.gFire; const char* a = d.aFire; int ms = d.fireMs;
@@ -2174,8 +2526,11 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
       // (measured 11-07: modes 8 and 16 keep moving for 10 s+, 1/2/4 stop after one pass of ~5 s). idlemode / idlerep
       // (replay every N ms, 0 = off) stay as knobs.
       const MPWDef& d = kMPW[g_mpw_slot.load() & 7]; const uint32_t im = (uint32_t)Bs2Knob("idlemode", 8); const int rep = (int)Bs2Knob("idlerep", 0);
-      if (d.gIdle) PlayMPAnim(ctx, base, pp, d.gIdle, 0, im);
-      if (d.aIdle) PlayMPAnim(ctx, base, pa, d.aIdle, 0, im);
+      if (d.gIdle) PlayMPAnim(ctx, base, pp, d.gIdle, 0, (d.aIdle && std::strncmp(d.aIdle, "Equip", 5) == 0) ? 4u : im);
+      // no real idle clip in the MP arm set (Elephant Gun: idle = its Equip clip): play it ONCE and hold the last frame.
+      // Looping it (mode 8) re-raised the gun forever - "the elephant gun keeps moving up and down" (Hayden 11-08).
+      const bool equip_idle = d.aIdle && std::strncmp(d.aIdle, "Equip", 5) == 0;
+      if (d.aIdle) PlayMPAnim(ctx, base, pa, d.aIdle, 0, equip_idle ? 4u : im);
       if (rep > 0) busy_until = now + std::chrono::milliseconds(rep); else idle_set = true; }
   } else
   if (uint32_t aa = g_anim_actor.load(); aa && g_mp_mesh.load() && !Bs2Variant("noanim")) {
@@ -2220,7 +2575,204 @@ void Bs2LoaderTick(PPCContext& ctx, uint8_t* base) {
   REXLOG_INFO("bioshock2: model: found {:08X} chain {}", m, chain);
   if (Bs2ClassNameOf(ctx, base, m) == "StaticMesh") { g_show_static = m; REXLOG_INFO("bioshock2: borrow: captured splicer pistol static mesh 'WP_AI_Pistol' by name (autotest)"); }
 }
+
+// 11-08: level change with MP content loaded crashed in UBoolProperty::SerializeItem (sub_828E4F78: this r3 = property,
+// r4 = archive, r5 = data) with data = 0x58, i.e. a null object's bool at +0x58, under LoadMap -> object cleanup.
+// Guard + log which property/class so the real culprit (a stale object we created/renamed) can be found.
+extern "C" void __imp__sub_828E4F78(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_828E4F78) {
+  if (ctx.r5.u32 < 0x10000) {
+    static int n = 0;
+    if (++n <= 20) { PPCContext k = ctx; const uint32_t pr = ctx.r3.u32, outer = Bs2Readable(pr, 0x20) ? BE32(base, pr + 0x18) : 0;
+      std::string pn = Bs2NameOf(ctx, base, pr); ctx = k; std::string on = outer ? Bs2NameOf(ctx, base, outer) : "-"; ctx = k;
+      REXLOG_INFO("bioshock2: GUARD bool property '{}' of '{}' serialized on a null object (data {:08X}, archive {:08X}, lr {:08X}) - skipped",
+                  pn, on, ctx.r5.u32, ctx.r4.u32, (uint32_t)ctx.lr); }
+    return; }
+  __imp__sub_828E4F78(ctx, base);
+}
+
+// UStruct tagged/bin property serializer (sub_828BE028: this r3 = struct/class, r4 = archive, r5 = data). Data < 0x10000
+// = a null object being serialized at level change: name its class (11-08 crash hunt) and skip it.
+extern "C" void __imp__sub_828BE028(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_828BE028) {
+  // 11-08 FIX: the null-data struct is an MP-package class stub (BS1MP.DualWieldHands, RF_NeedLoad still set) that the MP
+  // arms load dragged in. Its defaults block was never allocated; the walk uses the super's (Actor) property list ->
+  // reads null+offset. Give stubs from the MP/BS1 linker a zeroed 64 KB guest block (system heap, allocated once) so the
+  // walk reads/writes zeros instead of crashing. Anything else with null data is still skipped + logged.
+  if (ctx.r5.u32 < 0x10000) { const uint32_t lk = Bs2Readable(ctx.r3.u32, 0x40) ? BE32(base, ctx.r3.u32 + 0x10) : 0;
+    if (lk && (lk == g_mp_linker.load() || lk == g_bs1_linker.load())) {
+      static uint32_t zero = 0;
+      if (!zero) { zero = REX_KERNEL_MEMORY()->SystemHeapAlloc(0x10000, 0x100); if (zero) std::memset(base + zero, 0, 0x10000);
+        REXLOG_INFO("bioshock2: stub-defaults block {:08X} (64 KB zeroed)", zero); }
+      if (zero) { std::memset(base + zero, 0, 0x10000);
+        static int m = 0; if (++m <= 10) { PPCContext k = ctx; std::string sn = Bs2NameOf(ctx, base, ctx.r3.u32); ctx = k;
+          REXLOG_INFO("bioshock2: stub class '{}' {:08X} (foreign linker) serialized with null defaults -> zero block (lr {:08X})", sn, ctx.r3.u32, (uint32_t)ctx.lr); }
+        ctx.r5.u64 = zero; __imp__sub_828BE028(ctx, base); return; } } }
+  if (ctx.r5.u32 < 0x10000) {
+    static int n = 0;
+    if (++n <= 20) { PPCContext k = ctx; std::string sn = Bs2NameOf(ctx, base, ctx.r3.u32); ctx = k;
+      const uint32_t st = ctx.r3.u32, lk = Bs2Readable(st, 0x40) ? BE32(base, st + 0x10) : 0, fl = Bs2Readable(st, 0x40) ? BE32(base, st + 0x34) : 0;
+      std::string chain; for (uint32_t o = Bs2Readable(st, 0x20) ? BE32(base, st + 0x18) : 0, d = 0; o && d < 4 && Bs2Readable(o, 0x20); o = BE32(base, o + 0x18), ++d) { chain += Bs2NameOf(ctx, base, o) + "<"; ctx = k; }
+      REXLOG_INFO("bioshock2: GUARD struct '{}' {:08X} serialized with null data {:08X} (archive {:08X} r6 {:08X} r7 {:08X} lr {:08X}) outer {} linker {:08X}{} flags {:08X} - skipped",
+                  sn, st, ctx.r5.u32, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32, (uint32_t)ctx.lr, chain, lk, lk && lk == g_mp_linker.load() ? " (=MP linker)" : (lk && lk == g_bs1_linker.load() ? " (=BS1 linker)" : ""), fl); }
+    return; }
+  __imp__sub_828BE028(ctx, base);
+}
+
+// 11-08 level-change crash #2: sub_828C4F40 sorts the engine's loaded-objects list (r3 = UObject** data, r4 = count) by
+// linker + serial offset (comparator sub_828C45B0 reads obj->Linker(+0x10)->filename/+148 export table). Our MP/BS1 loads
+// call CreateExport/Preload directly, so their objects stay in that list; at the next map load the engine has freed those
+// linkers and the comparator reads garbage. Replace entries from our foreign linkers (or with an unreadable linker) by a
+// harmless already-loaded entry from the same list before the sort. Those objects are loaded and in use already.
+extern "C" void __imp__sub_828C4F40(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_828C4F40) {
+  const uint32_t arr = ctx.r3.u32, n = ctx.r4.u32;
+  { static int c = 0; if (++c <= 6) { std::string w; for (uint32_t i = 0; i < 6 && i < n && Bs2Readable(arr + 4 * i, 4); ++i) { char b[12]; snprintf(b, sizeof b, "%08X ", BE32(base, arr + 4 * i)); w += b; }
+      REXLOG_INFO("bioshock2: loaded-list sort call #{} arr {:08X} n {} readable {} first: {}", c, arr, n, arr && n < 200000 && Bs2Readable(arr, n * 4), w); } }
+  { static int big = 0; if (n >= 2000 && ++big <= 20) REXLOG_INFO("bioshock2: loaded-list sort arr {:08X} n {} (big)", arr, n); }
+  if (g_level_gen >= 3 && n > 1000 && Bs2Readable(arr, 4)) {   // 11-08: class histogram of the level-change load list (crash vs clean diff)
+    static int done = 0;
+    if (done++ < 2) { std::map<uint32_t, int> cls; uint32_t needload = 0;
+      for (uint32_t i = 0; i < n; ++i) { uint32_t o = BE32(base, arr + 4 * i); if (o < 0x30000000u || !Bs2Readable(o, 0x40)) { ++cls[0]; continue; }
+        ++cls[BE32(base, o + 0x24)]; if (BE32(base, o + 0x34) & 0x200) ++needload; }
+      std::vector<std::pair<int, uint32_t>> v; for (auto& [c, k] : cls) v.push_back({k, c}); std::sort(v.rbegin(), v.rend());
+      std::string w; PPCContext k = ctx; for (size_t i = 0; i < v.size() && i < 60; ++i) { w += (v[i].second ? Bs2NameOf(ctx, base, v[i].second) : std::string("<bad>")) + "=" + std::to_string(v[i].first) + " "; ctx = k; }
+      REXLOG_INFO("bioshock2: LEVELLIST n {} needload {} classes {}: {}", n, needload, v.size(), w); } }
+  if (arr && n > 1 && n < 4000000 && Bs2Readable(arr, 4) && Bs2Readable(arr + (n - 1) * 4, 4)) {
+    const uint32_t ml = g_mp_linker.load(), bl = g_bs1_linker.load();
+    auto bad = [&](uint32_t o) { if (!o || o < 0x30000000u || o >= 0x80000000u || !Bs2Readable(o, 0x40)) return true;
+      { const uint32_t ov = BE32(base, o); if (ov < 0x82000000u || ov >= 0x83000000u) return true; }   // a UObject has its vtable in the image
+      uint32_t l = BE32(base, o + 0x10);
+      if (!l) return false; if (l == ml || l == bl) return true; if (!Bs2Readable(l, 0x100)) return true;
+      const uint32_t ex = BE32(base, l + 148), en = BE32(base, l + 152), ix = BE32(base, o + 0x14);   // export table / count / this object's index
+      const uint32_t vt = BE32(base, l), fnm = BE32(base, l + 28);
+      // freed + reused linker memory reads as "readable" garbage: insist on a vtable in the image and a heap export table
+      if (vt < 0x82000000u || vt >= 0x83000000u) return true;
+      if (ex < 0x30000000u || ex >= 0x80000000u) return true;
+      // EndLoad preloads NeedLoad objects through linker+184 (its loader archive) -> vtable[+32]: both must be sane
+      { const uint32_t ld = BE32(base, l + 184); if (ld < 0x82000000u || ld >= 0x83000000u) return true;
+        const uint32_t pf = BE32(base, ld + 32); if (pf < 0x82000000u || pf >= 0x83000000u) return true; }
+      (void)fnm;
+      return en == 0 || en > 2000000 || ix >= en || !Bs2Readable(ex + ix * 52, 52); };
+    uint32_t safe = 0; for (uint32_t i = 0; i < n && !safe; ++i) { uint32_t o = BE32(base, arr + 4 * i); if (!bad(o)) safe = o; }
+    int fixed = 0;
+    if (safe) for (uint32_t i = 0; i < n; ++i) { uint32_t o = BE32(base, arr + 4 * i); if (bad(o)) {
+      static int d0 = 0; if ((o < 0x30000000u || o >= 0x80000000u) && ++d0 <= 12) REXLOG_INFO("bioshock2: loaded-list bad entry #{} = {:08X} (not a heap object)", i, o);
+      static int d = 0; if (o >= 0x30000000u && o < 0x80000000u && ++d <= 12 && Bs2Readable(o, 0x40)) { PPCContext k = ctx; uint32_t l = BE32(base, o + 0x10);
+        std::string cn = Bs2ClassNameOf(ctx, base, o); ctx = k; std::string nm = Bs2NameOf(ctx, base, o); ctx = k;
+        REXLOG_INFO("bioshock2: loaded-list bad entry {:08X} {} '{}' linker {:08X} idx {} (linker exports {:08X} n {}) flags {:08X}", o, cn, nm, l, BE32(base, o + 0x14),
+                    l && Bs2Readable(l, 0x100) ? BE32(base, l + 148) : 0, l && Bs2Readable(l, 0x100) ? BE32(base, l + 152) : 0, BE32(base, o + 0x34)); }
+      PutBE32Pub(base, arr + 4 * i, safe); ++fixed; } }
+    if (fixed) { static int k = 0; if (++k <= 20) REXLOG_INFO("bioshock2: loaded-list sort: {} of {} entries were foreign/stale (MP linker {:08X}, BS1 {:08X}) -> replaced by {:08X}", fixed, n, ml, bl, safe); }
+  }
+  __imp__sub_828C4F40(ctx, base);
+}
+
+// ---- level lifecycle (11-08) ----
+// sub_82479FA0 = map load (UGameEngine::LoadMap-like, called from Browse sub_82474AA0). Everything we built is level-
+// scoped or must not leak into the level-state save: put zeroed mesh sections back (the meshes outlive the level), detach
+// the MP meshes from our puppets, mark puppets + their mesh instances transient, drop every level-actor pointer.
+// 11-08 level-change root cause (bisect runs 61-70): LoadMPArmsMesh PostLoads the MP arms' animation objects, which
+// register themselves with the engine's anim tables. The map change garbage-collects the unreferenced MP package ->
+// those tables keep freed pointers -> the next level's EndLoad reads garbage. Pin every loaded foreign export with
+// RF_Native (0x04000000, the flag LoadMap's CollectGarbage keeps) so it lives for the session; this also means the MP
+// meshes need no reload after a level change.
+static void PinForeignExports(PPCContext& ctx, uint8_t* base) {
+  for (uint32_t l : {g_mp_linker.load(), g_bs1_linker.load()}) { if (!l || !Bs2Readable(l, 0xC0)) continue;
+    uint32_t ed = BE32(base, l + 148), en = BE32(base, l + 152), pinned = 0, skipped = 0;
+    if (!ed || en > 200000) continue;
+    for (uint32_t i = 0; i < en; ++i) { uint32_t o = BE32(base, ed + i * 52 + 40);
+      if (o < 0x30000000u || o >= 0x80000000u) continue;
+      uint32_t f = BE32(base, o + 0x34);
+      if (f & 0x200u) { ++skipped; continue; }
+      { bool script = false; uint32_t x = o;   // a UClass (class-of-class == itself) or anything inside one (functions, states, properties)
+        for (int d = 0; d < 8 && x && Bs2Readable(x, 0x28); ++d, x = BE32(base, x + 0x18)) { uint32_t c = BE32(base, x + 0x24); if (c && Bs2Readable(c, 0x28) && BE32(base, c + 0x24) == c) { script = true; break; } }
+        { std::string cn = Bs2ClassNameOf(ctx, base, o); if (cn == "Function" || cn == "State" || cn == "Struct" || cn == "Enum" || cn == "Const" || cn == "TextBuffer" || cn.find("Property") != std::string::npos) script = true; }
+        if (script) { ++skipped; continue; } }
+      // BS1MP.DualWieldHands survived as a half-built Actor class and 822307F8 (level actor init) read its +1252 (run 79)   // never-loaded placeholders: let GC take them (a half-loaded survivor crashed actor init, run 72)
+      if (!(f & 0x04000000u)) { PutBE32Pub(base, o + 0x34, f | 0x04000000u); ++pinned; } }
+    if (l == g_mp_linker.load()) if (uint32_t mp = g_mp_package.load()) PutBE32Pub(base, mp + 0x34, BE32(base, mp + 0x34) | 0x04000000u);
+    REXLOG_INFO("bioshock2: pin: linker {:08X} exports {} -> {} newly pinned (RF_Native), {} unloaded left to GC", l, en, pinned, skipped); }
+}
+void Bs2MPTeardown(PPCContext& ctx, uint8_t* base, const char* why) {
+  if (!Bs2Variant("nopin")) PinForeignExports(ctx, base);
+  int restored = 0;
+  for (auto* m : {&g_sec_orig, &g_hide_orig}) { for (auto& [f, v] : *m) if (Bs2Readable(f & ~1u, 4)) { base[f] = uint8_t(v >> 8); base[f + 1] = uint8_t(v); ++restored; } m->clear(); }
+  g_hide_kids.clear();
+  // Foreign actors (the BS1 revolver brain BS1Game.Pistol, its ammo...) must not ride into the next level: the level
+  // change carries the player's inventory over and re-serializes it -> EndLoad crash (run 85, 828CBDA8 null+0x1C).
+  if (!Bs2Variant("nodropforeign")) if (uint32_t pawn = Bs2PlayerPawn(); pawn && Bs2Readable(pawn, 0x200)) {
+    const uint32_t ml = g_mp_linker.load(), bl = g_bs1_linker.load();
+    uint32_t lvl = BE32(base, pawn + 256), arr = lvl ? BE32(base, lvl + 0x3C) : 0, n = lvl ? BE32(base, lvl + 0x40) : 0; std::vector<uint32_t> kill;
+    if (arr && n < 200000 && Bs2Readable(arr, n * 4))
+      for (uint32_t i = 0; i < n; ++i) { uint32_t a = BE32(base, arr + 4 * i); if (!a || !Bs2Readable(a, 0x40)) continue;
+        uint32_t c = BE32(base, a + 0x24), cl = (c && Bs2Readable(c, 0x20)) ? BE32(base, c + 0x10) : 0;
+        if (cl && (cl == ml || cl == bl)) kill.push_back(a); }
+    for (uint32_t a : kill) { std::string cn = Bs2ClassNameOf(ctx, base, a); uint8_t pr[16] = {}; PPCContext k = ctx;
+      { uint8_t pd[16] = {}; PutBE32Pub(pd, 0, a); uint32_t f2 = Bs2CallParms(ctx, base, pawn, "Engine.Pawn", "DeleteInventory", pd, 16); ctx = k;
+        REXLOG_INFO("bioshock2: MP teardown: Pawn.DeleteInventory({:08X} {}) fn {:08X}; pawn weapon now {:08X}", a, cn, f2, BE32(base, pawn + 0x6F4)); }
+      if (BE32(base, pawn + 0x6F4) == a) PutBE32Pub(base, pawn + 0x6F4, 0);
+      uint32_t fn = Bs2CallParms(ctx, base, a, "Engine.Actor", "Destroy", pr, 16); ctx = k;
+      REXLOG_INFO("bioshock2: MP teardown: foreign actor {:08X} {} Destroy fn {:08X} ret {:08X}", a, cn, fn, GB32(pr)); }
+    g_attached_foreign = 0; g_foreign_weapon = 0; }
+  int det = 0;
+  // bone attachments first (gun on the arms' socket, arms on Delta's hands with fpatt): the parent's mesh instance keeps an
+  // attached-actor list, and SetMesh(None)/Destroy below would otherwise leave it pointing at freed puppets (11-08 bisect)
+  if (!Bs2Variant("nodetach")) for (uint32_t a : {g_puppet.load(), g_puppet_arms.load()}) if (a && Bs2Readable(a, 0x200)) {
+    uint32_t par = BE32(base, a + 0xAC);
+    if (par && Bs2Readable(par, 0x200)) { uint8_t pr[16] = {}; PutBE32Pub(pr, 0, a); PPCContext k = ctx;
+      uint32_t fn = Bs2CallParms(ctx, base, par, "Engine.Actor", "DetachFromBone", pr, 16); ctx = k;
+      REXLOG_INFO("bioshock2: MP teardown: {:08X}.DetachFromBone({:08X}) fn {:08X} ret {:08X} -> Base now {:08X}", par, a, fn, GB32(pr + 4), BE32(base, a + 0xAC)); }
+    if (BE32(base, a + 0xAC)) { uint8_t pb[32] = {}; PPCContext k = ctx; uint32_t fn = Bs2CallParms(ctx, base, a, "Engine.Actor", "SetBase", pb, 32); ctx = k;
+      REXLOG_INFO("bioshock2: MP teardown: {:08X}.SetBase(None) fn {:08X} -> Base now {:08X}", a, fn, BE32(base, a + 0xAC)); }
+  }
+  if (!Bs2Variant("noteardown")) for (uint32_t a : {g_puppet.load(), g_puppet_arms.load()}) if (a && Bs2Readable(a, 0x200)) {
+    // out of the scene FIRST (SetDrawType 0 = scene Remove): the renderer kept skinning into the instance's bone buffers
+    // after GC freed them - 1.0f identity values (0x3F800000) turned up as pointers in EndLoad's arrays (11-08)
+    { PPCContext k0 = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x3000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = 0; __imp__sub_82378F10(ctx, base); ctx = k0; }
+    if (uint32_t inst = BE32(base, a + 0x168); inst && Bs2Readable(inst, 0x40)) PutBE32Pub(base, inst + 0x34, BE32(base, inst + 0x34) | 0x4000u);
+    PutBE32Pub(base, a + 0x34, BE32(base, a + 0x34) | 0x4000u);
+    PPCContext k = ctx; ctx.r1.u64 = (ctx.r1.u32 - 0x8000) & ~0xFu; ctx.r3.u64 = a; ctx.r4.u64 = 0; __imp__sub_824DDCD8(ctx, base); ctx = k;   // SetMesh(None)
+    if (uint32_t inst = BE32(base, a + 0x168); inst && Bs2Readable(inst, 0x40)) PutBE32Pub(base, inst + 0x34, BE32(base, inst + 0x34) | 0x4000u);
+    // their anim player/components still reference MP anim sets and would ride into the level-state save: destroy the actor
+    { uint8_t pr[16] = {}; PPCContext k2 = ctx; uint32_t fn = Bs2CallParms(ctx, base, a, "Engine.Actor", "Destroy", pr, 16); ctx = k2;
+      REXLOG_INFO("bioshock2: MP teardown: Destroy({:08X}) fn {:08X} ret {:08X}", a, fn, GB32(pr)); }
+    ++det; }
+  g_puppet = 0; g_puppet_arms = 0; g_anim_actor = 0; g_arms_actor = 0; g_rivet_actor = 0; g_rivet_hands = 0; g_ai_pistol_actor = 0;
+  g_attached_foreign = 0; g_foreign_weapon = 0; g_mpw_brain = 0; g_mpw_look = false; g_mpw_firing = false; g_wheel_pending = 0;
+  g_fs_hands = 0; g_fs_gun = 0; g_fs_hands_comp = 0; g_fs_gun_comp = 0; g_fs_pprim_arms = 0; g_fs_pprim_gun = 0;
+  g_pend_a = 0; g_pend_b = 0; g_show_static = 0; g_anim_comp = 0;
+  ++g_level_gen;
+  REXLOG_INFO("bioshock2: MP teardown ({}): restored {} mesh sections, detached {} puppets, level gen {}", why, restored, det, g_level_gen);
+}
+extern "C" void __imp__sub_82479FA0(PPCContext& __restrict ctx, uint8_t* base);
+// 11-08 level change, part 3: the new level's init walks every object (GObjObjects 83004D64) for actors (822307F8),
+// precache (82598B30) etc. and trips over the surviving MP objects (stub classes, MP shaders without render data).
+// While the map loads, foreign objects are taken out of GObjObjects (slot NULL; the engine's iterators skip NULLs and the
+// slots are not on the free list, so nothing new lands there) and put back afterwards. GC never sees them, so they
+// also survive it - the pin above is belt and braces.
+extern "C" REX_FUNC(sub_82479FA0) {
+  { PPCContext k = ctx; Bs2MPTeardown(ctx, base, "map load"); ctx = k; }
+  std::vector<std::pair<uint32_t, uint32_t>> hid;
+  if (const uint32_t ml = g_mp_linker.load(), bl = g_bs1_linker.load(), mpk = g_mp_package.load(); (ml || bl) && !Bs2Variant("nohideobjs")) {
+    const uint32_t arr = BE32(base, 0x83004D64u), n = BE32(base, 0x83004D68u);
+    for (uint32_t i = 0; i < n && i < 4000000; ++i) { const uint32_t o = BE32(base, arr + 4 * i);
+      if (!o || (o & 3) || o < 0x30000000u || o >= 0x80000000u || !Bs2Readable(o, 0x40)) continue;
+      const uint32_t l = BE32(base, o + 0x10);
+      bool foreign = (ml && l == ml) || (bl && l == bl) || (mpk && o == mpk) || (ml && o == ml) || (bl && o == bl);
+      if (!foreign && mpk) for (uint32_t x = BE32(base, o + 0x18), d = 0; x && d < 6 && Bs2Readable(x, 0x20); x = BE32(base, x + 0x18), ++d) if (x == mpk) { foreign = true; break; }
+      if (foreign) { hid.push_back({arr + 4 * i, o}); PutBE32Pub(base, arr + 4 * i, 0); } }
+    REXLOG_INFO("bioshock2: map load: {} foreign objects hidden from GObjObjects during the load", hid.size()); }
+  if (!hid.empty()) { Bs2Heartbeat(); Bs2HangArm(true); }   // a stuck load dumps logs/hang_*.txt
+  __imp__sub_82479FA0(ctx, base);
+  if (!hid.empty()) { Bs2HangArm(false); Bs2Heartbeat(); }
+  int back = 0, lost = 0;
+  for (auto [slot, o] : hid) { if (BE32(base, slot) == 0) { PutBE32Pub(base, slot, o); ++back; } else ++lost; }
+  if (!hid.empty()) REXLOG_INFO("bioshock2: map load done: {} foreign objects back in GObjObjects ({} slots reused - dropped)", back, lost);
+}
 extern "C" REX_FUNC(sub_82378F10) {
+  if (uint32_t h = g_rivet_hands.load(); h && ctx.r3.u32 == h) {   // fpswap: who hides PlayerHands? (11-08: DrawType 2 -> 0 after the swap)
+    static int n = 0; if (++n <= 30) REXLOG_INFO("bioshock2: fpswap: SetDrawType(PlayerHands {:08X}, {}) from lr {:08X} (was {}, fpswap {})", h, ctx.r4.u32 & 0xFF, (uint32_t)ctx.lr, base[h + 157], g_fs_hands.load() ? 1 : 0); }
   { std::string c = Bs2ClassNameOf(ctx, base, ctx.r3.u32);
     static int k = 0; if (IsAIPistolClass(c) && !Bs2IsForeignObject(ctx, base, ctx.r3.u32) && ++k <= 6) REXLOG_INFO("bioshock2: borrow: {} SetDrawType({})", c, ctx.r4.u32 & 0xFF); }
   if (g_show_static.load() && Bs2IsForeignObject(ctx, base, ctx.r3.u32)) {
@@ -2288,11 +2840,20 @@ void Bs2PuppetCamSnap(PPCContext& ctx, uint8_t* base, uint32_t parms) {
     REXLOG_INFO("bioshock2: mp: camsnap cam {:.1f} {:.1f} {:.1f} rot {} {} {} viewactor {:08X} | arms were {:.1f} {:.1f} {:.1f} pawn {:08X}", cx, cy, cz, rp, ry, rr, BE32(base, parms),
       GetF(base, pa + lo), GetF(base, pa + lo + 4), GetF(base, pa + lo + 8), pw); }
   const MPWDef& dw = kMPW[g_mpw_slot.load() & 7];
-  const float fwd = Bs2Knob("pf", dw.pf), rgt = Bs2Knob("pr", dw.pr), up = Bs2Knob("pu", dw.pu);
+  float fwd = Bs2Knob("pf", dw.pf), rgt = Bs2Knob("pr", dw.pr), up = Bs2Knob("pu", dw.pu);
+  // fpscale: scale about the TRUE camera (this snap), so the picture is unchanged and only the physical size shrinks.
+  // Offsets are camera-space: rotate by view (pitch + yaw) - the old code applied 'up' in world Z, fine at s=1, but
+  // scaling a world-Z offset tilts the framing when looking up/down; use the full view basis here.
+  const float fps_ = Bs2Knob("fpscale", 0.35f), sc = (fps_ > 0.01f && fps_ < 1.0f) ? fps_ : 1.0f;
+  fwd *= sc; rgt *= sc; up *= sc;
   const double yaw = ry * 3.14159265358979 / 32768.0, pit = rp * 3.14159265358979 / 32768.0;
   const float fx = float(std::cos(pit) * std::cos(yaw)), fy = float(std::cos(pit) * std::sin(yaw)), fz = float(std::sin(pit));
   const float rx = float(-std::sin(yaw)), ryv = float(std::cos(yaw));
-  PutF(base, pa + lo, cx + fx * fwd + rx * rgt); PutF(base, pa + lo + 4, cy + fy * fwd + ryv * rgt); PutF(base, pa + lo + 8, cz + fz * fwd + up);
+  // view up vector = forward x right (pitch-aware): (-sin p cos y, -sin p sin y, cos p)
+  const float ux = float(-std::sin(pit) * std::cos(yaw)), uy = float(-std::sin(pit) * std::sin(yaw)), uz = float(std::cos(pit));
+  const bool vup = sc != 1.0f || Bs2Knob("viewup", 0) != 0;
+  if (vup) { PutF(base, pa + lo, cx + fx * fwd + rx * rgt + ux * up); PutF(base, pa + lo + 4, cy + fy * fwd + ryv * rgt + uy * up); PutF(base, pa + lo + 8, cz + fz * fwd + uz * up); }
+  else { PutF(base, pa + lo, cx + fx * fwd + rx * rgt); PutF(base, pa + lo + 4, cy + fy * fwd + ryv * rgt); PutF(base, pa + lo + 8, cz + fz * fwd + up); }
   PutBE32Pub(base, pa + 0x1E8, uint32_t(rp + (int32_t)Bs2Knob("prp", dw.prp))); PutBE32Pub(base, pa + 0x1EC, uint32_t(ry + (int32_t)Bs2Knob("pry", dw.pry))); PutBE32Pub(base, pa + 0x1F0, uint32_t(rr + (int32_t)Bs2Knob("prr", 0)));
 }
 
@@ -2325,7 +2886,7 @@ void Bs2PuppetFPDraw(PPCContext& ctx, uint8_t* base, uint32_t canvas) {
 // Second weapon wheel (weapon_wheel.h) -> game thread. Slot 0 = Revolver (the BS1 Pistol actor is its brain: fire,
 // ammo, reload; the MP puppets are its look). Other slots = MP weapons, not ported yet. Knob wheel=N fires slot N-1
 // (testing); wheel=99 equips the rivet gun (to test switching away and back).
-void Bs2WheelRequest(int slot) { g_wheel_req = slot + 1; }
+void Bs2WheelRequest(int slot) { REXLOG_INFO("bioshock2: wheel: picked slot {} ({})", slot, slot >= 0 && slot < 8 ? kMPW[slot].name : "?"); g_wheel_req = slot + 1; }
 void Bs2QueueGive(std::string spec); void Bs2QueueCommand(std::string cmd);
 static void WheelEquip(PPCContext& ctx, uint8_t* base, int req) {
   uint32_t pawn = Bs2PlayerPawn(); if (!pawn) { REXLOG_INFO("bioshock2: wheel: no player pawn"); return; }
@@ -2335,7 +2896,7 @@ static void WheelEquip(PPCContext& ctx, uint8_t* base, int req) {
     const int slot = req - 1;
     if (slot && !g_mpw_mesh[slot].load()) { REXLOG_INFO("bioshock2: wheel: {} mesh not loaded", kMPW[slot].name); return; }
     g_mpw_slot = slot; what = kMPW[slot].name;
-    if (slot > 0 && kBrain[slot]) {   // BS2 weapon brain: find the player's one, give it if missing (then retry)
+    if (kBrain[slot] && !(slot == 0 && Bs2Variant("bs1"))) {   // BS2 weapon brain: find the player's one, give it if missing (then retry)
       const std::string cls = kBrain[slot]; PPCContext k2 = ctx;
       for (int i = 0; i < 16; ++i) {
         uint32_t sp4 = (ctx.r1.u32 - 0x8000) & ~0xFu, str = sp4 + 0x2000; PutWide(base, str, cls + std::to_string(i));
@@ -2344,6 +2905,7 @@ static void WheelEquip(PPCContext& ctx, uint8_t* base, int req) {
       if (!target) {
         if (g_wheel_pending.load() == req) { REXLOG_INFO("bioshock2: wheel: {} brain {} still missing after the give", what, cls); g_wheel_pending = 0; return; }
         REXLOG_INFO("bioshock2: wheel: {} needs {} - giving it", what, cls);
+        g_mpw_equip_ms = Bs2NowMs();
         Bs2QueueCommand("GiveWeapon Weapons." + cls); g_wheel_pending = req;
         static const std::map<std::string, std::vector<const char*>> ammo = {   // a full load for the brain (names from the F9 panel + live FName log)
           // ONLY names the F9 panel already gives safely: a guessed name ("MachineGun_Standard") resolved to an MP
@@ -2357,21 +2919,22 @@ static void WheelEquip(PPCContext& ctx, uint8_t* base, int req) {
       g_wheel_pending = 0; g_mpw_brain = target; g_mpw_look = true;
       if (target == cur) { REXLOG_INFO("bioshock2: wheel: {} ({}) already in hand - look switched", what, cls); return; }
     }
-    if (slot == 0) for (uint32_t c : {g_wheel_pistol.load(), g_attached_foreign.load(), Bs2ForeignWeapon()})
+    if (slot == 0 && Bs2Variant("bs1")) for (uint32_t c : {g_wheel_pistol.load(), g_attached_foreign.load(), Bs2ForeignWeapon()})
       if (!target && c && Bs2Readable(c, 0x200) && Bs2ClassNameOf(ctx, base, c) == "Pistol") target = c;
     uint32_t own = ActorPropOffset(ctx, base, "Owner");
     PPCContext k = ctx;
-    for (int i = 0; i < 16 && !target && slot == 0; ++i) {
+    for (int i = 0; i < 16 && !target && slot == 0 && Bs2Variant("bs1"); ++i) {
       uint32_t sp4 = (ctx.r1.u32 - 0x8000) & ~0xFu, str = sp4 + 0x2000; PutWide(base, str, "Pistol" + std::to_string(i));
       ctx.r1.u64 = sp4; ctx.r3.u64 = 0; ctx.r4.u64 = 0xFFFFFFFFu; ctx.r5.u64 = str; ctx.r6.u64 = 0; __imp__sub_828D2190(ctx, base); uint32_t o = ctx.r3.u32; ctx = k;
       if (o && Bs2ClassNameOf(ctx, base, o) == "Pistol" && (!own || own > 0x1000 || BE32(base, o + own) == pawn)) target = o; }
     if (slot == 0 && target) { g_mpw_brain = target; g_mpw_look = true; }
-    if (slot == 0 && !target) { REXLOG_INFO("bioshock2: wheel: no Revolver owned - giving it (equips on give)");
+    if (slot == 0 && !target && Bs2Variant("bs1")) { REXLOG_INFO("bioshock2: wheel: no Revolver owned - giving it (equips on give)");
       Bs2QueueGive("BS1Game.Pistol"); Bs2QueueCommand("GiveWeapon BS1Game.Pistol"); return; }
   } else { REXLOG_INFO("bioshock2: wheel: slot {} not ported yet", req - 1); return; }
   if (!target) { REXLOG_INFO("bioshock2: wheel: {} not found", what); return; }
   if (target == cur) { REXLOG_INFO("bioshock2: wheel: {} already in hand", what); return; }
   uint8_t pr[32] = {}; PB32(pr, target);
+  g_mpw_equip_ms = Bs2NowMs();
   uint32_t fn = Bs2CallParms(ctx, base, pawn, "ShockGame.ShockPlayer", "Equip", pr, 32);
   REXLOG_INFO("bioshock2: wheel: Equip({} {:08X} {}) fn {:08X} -> ret {:08X} {:08X}; weapon now {:08X} (was {:08X})", what, target, Bs2ClassNameOf(ctx, base, target), fn,
     GB32(pr + 4), GB32(pr + 8), BE32(base, pawn + 0x6F4), cur);
@@ -2439,3 +3002,54 @@ static void MPWeaponsProbe(PPCContext& ctx, uint8_t* base) {
   }
 }
 float Bs2KnobPub(const char* k, float d) { return Bs2Knob(k, d); }   // for bridge_cheats.cpp (test input)
+// 11-08 level-change crash #2 (after pinning): 822307F8 walks GObjObjects (83004D64) for IsA(<822208D0 class>) and
+// reads obj+1252 -> obj+1252 was NULL on some survivor. Log who, before the engine trips on it.
+extern "C" void __imp__sub_822307F8(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_822208D0(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82220538(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82220438(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_822307F8) {
+  if (Bs2Variant("initscan")) { PPCContext k = ctx; const uint32_t sp = (k.r1.u32 - 0x1000) & ~0xFu, it = sp + 0x400;
+    ctx.r1.u64 = sp; __imp__sub_82220538(ctx, base); PutBE32Pub(base, it, ctx.r3.u32); PutBE32Pub(base, it + 4, 0xFFFFFFFFu); ctx = k;
+    ctx.r1.u64 = sp; ctx.r3.u64 = it; __imp__sub_82220438(ctx, base); ctx = k;
+    int bad = 0, hits = 0, guard = 0;
+    while ((int32_t)BE32(base, it + 4) < (int32_t)BE32(base, 0x83004D68u) && ++guard < 3000000) {
+      uint32_t o = BE32(base, BE32(base, 0x83004D64u) + 4 * BE32(base, it + 4));
+      ctx.r1.u64 = sp; __imp__sub_822208D0(ctx, base); uint32_t K = ctx.r3.u32; ctx = k;
+      { const bool rd = (o & 3) == 0 && o >= 0x30000000u && o < 0x80000000u && Bs2Readable(o, 0x40); uint32_t vt = rd ? BE32(base, o) : 0;
+        const uint32_t fv = (vt >> 24) == 0x82 ? BE32(base, vt + 300) : 0;
+        if ((vt >> 24) != 0x82 || fv < 0x82100000u || fv >= 0x82A00000u || (fv & 3)) { static int nb = 0;
+          if (++nb <= 20) { std::string w; if (rd) for (uint32_t q = 0; q < 0x40; q += 4) w += fmt_hex(BE32(base, o + q)) + " ";
+            uint32_t ix = BE32(base, it + 4), arr = BE32(base, 0x83004D64u);
+            for (int d = -3; d <= 3; ++d) if (d && (int32_t)ix + d >= 0) w += " [" + std::to_string(d) + "]" + fmt_hex(BE32(base, arr + 4 * (ix + d)));
+            REXLOG_INFO("bioshock2: initscan: STALE GObjObjects[{}] = {:08X} vt {:08X} isa {:08X}: {}", BE32(base, it + 4), o, vt, fv, w); }
+          ctx.r1.u64 = sp; ctx.r3.u64 = it; __imp__sub_82220438(ctx, base); ctx = k; continue; } }
+      uint32_t f = BE32(base, BE32(base, o) + 300);
+      ctx.r1.u64 = sp; ctx.r3.u64 = o; ctx.r4.u64 = K; { REX_CALL_INDIRECT_FUNC(f); } uint32_t is = ctx.r3.u32; ctx = k;
+      if (is) { ++hits; uint32_t a = BE32(base, o + 1252);
+        if ((a == 0 || !Bs2Readable(a, 0x200)) && ++bad <= 12)
+          REXLOG_INFO("bioshock2: initscan: {:08X} {} '{}' flags {:08X} outer {:08X} '{}' linker {:08X} +1252 {:08X}", o, Bs2ClassNameOf(ctx, base, o), Bs2NameOf(ctx, base, o),
+                      BE32(base, o + 0x34), BE32(base, o + 0x18), BE32(base, o + 0x18) ? Bs2NameOf(ctx, base, BE32(base, o + 0x18)) : "-", BE32(base, o + 0x10), a);
+        if (hits == 1) REXLOG_INFO("bioshock2: initscan: class {:08X} '{}'", K, Bs2NameOf(ctx, base, K)); }
+      ctx.r1.u64 = sp; ctx.r3.u64 = it; __imp__sub_82220438(ctx, base); ctx = k; }
+    REXLOG_INFO("bioshock2: initscan: gen {} matches {} bad {}", g_level_gen, hits, bad); }
+  // Fix: foreign (BS1MP/BS1Game) objects that answer IsA(Actor) but are not level actors (the BS1MP.DualWieldHands class
+  // stub, run 82) are hidden from this one walk: their GObjObjects slot is NULL while it runs (the iterator skips NULLs).
+  std::vector<std::pair<uint32_t, uint32_t>> hid;
+  if (const uint32_t ml = g_mp_linker.load(), bl = g_bs1_linker.load(); (ml || bl) && !Bs2Variant("noinitguard")) {
+    PPCContext k = ctx; const uint32_t sp = (k.r1.u32 - 0x1000) & ~0xFu;
+    ctx.r1.u64 = sp; __imp__sub_822208D0(ctx, base); const uint32_t K = ctx.r3.u32; ctx = k;
+    const uint32_t arr = BE32(base, 0x83004D64u), it = sp + 0x400;   // the engine's own object iterator (82220538/82220438): skips what it skips
+    ctx.r1.u64 = sp; __imp__sub_82220538(ctx, base); PutBE32Pub(base, it, ctx.r3.u32); PutBE32Pub(base, it + 4, 0xFFFFFFFFu); ctx = k;
+    auto next = [&] { ctx.r1.u64 = sp; ctx.r3.u64 = it; __imp__sub_82220438(ctx, base); ctx = k; };
+    for (next(); (int32_t)BE32(base, it + 4) < (int32_t)BE32(base, 0x83004D68u); next()) { const uint32_t i = BE32(base, it + 4), o = BE32(base, arr + 4 * i);
+      if (!o || (o & 3) || o < 0x30000000u || o >= 0x80000000u || !Bs2Readable(o, 0x40)) continue;
+      const uint32_t l = BE32(base, o + 0x10); if (!l || (l != ml && l != bl)) continue;
+      const uint32_t vt = BE32(base, o); if ((vt >> 24) != 0x82) continue; const uint32_t f = BE32(base, vt + 300); if (f < 0x82100000u || f >= 0x82A00000u) continue;
+      ctx.r1.u64 = sp; ctx.r3.u64 = o; ctx.r4.u64 = K; { REX_CALL_INDIRECT_FUNC(f); } const uint32_t is = ctx.r3.u32; ctx = k;
+      if (!is) continue; const uint32_t a = BE32(base, o + 1252); if (a && Bs2Readable(a, 0x200)) continue;
+      hid.push_back({arr + 4 * i, o}); PutBE32Pub(base, arr + 4 * i, 0);
+      static int lg = 0; if (++lg <= 8) REXLOG_INFO("bioshock2: initguard: hid foreign {} '{}' ({:08X}) from level actor init", Bs2ClassNameOf(ctx, base, o), Bs2NameOf(ctx, base, o), o); } }
+  __imp__sub_822307F8(ctx, base);
+  for (auto [slot, o] : hid) if (BE32(base, slot) == 0) PutBE32Pub(base, slot, o);
+}

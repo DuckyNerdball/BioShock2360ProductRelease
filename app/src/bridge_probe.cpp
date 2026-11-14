@@ -371,9 +371,14 @@ static void FireForeignWeapon(PPCContext& ctx, uint8_t* base, uint32_t w) {
   ctx = saved;
   static int n = 0; if (++n <= 20) REXLOG_INFO("bioshock2: shim: InitiateDamage on BS1 weapon {:08X} (stand-in for the firing anim notify)", w);
 }
+bool Bs2HangTraceTake();   // crash_trace.cpp
+bool Bs2FsActive(); void Bs2FsAnimResult(PPCContext& ctx, uint8_t* base, const std::string& fn, uint32_t self, uint32_t result);   // bridge_loader.cpp
 extern "C" REX_FUNC(sub_828FB510) {   // CallFunction(this=r3, FFrame*=r4, Result=r5, UFunction*=r6)
   g_n_callfn++;
   if (ctx.r6.u32 == 0) { SkipMissingCall(ctx, base); return; }
+  if (Bs2HangTraceTake()) { PPCContext k = ctx; uint32_t self = ctx.r3.u32, fn = ctx.r6.u32;   // hang watchdog fired: name the loop body
+    std::string sc = ClassNameOf(ctx, base, self); ctx = k; std::string sn = NameOf(ctx, base, self); ctx = k; std::string f = FnName(ctx, base, fn); ctx = k;
+    REXLOG_INFO("bioshock2: HANGTRACE {:08X} {} '{}' -> {}", self, sc, sn, f); }
   if (ctx.r3.u32 && ctx.r3.u32 == Bs2MPWBrain()) { PPCContext k = ctx; BrainEvent(ctx, base, ctx.r3.u32, ctx.r6.u32); ctx = k; }
   if (uint32_t fw = Bs2ForeignWeapon(); fw && ctx.r3.u32 == fw) {   // drive the MP arm/gun puppets from the BS1 pistol's own script
     const std::string& fnm = FnName(ctx, base, ctx.r6.u32);
@@ -388,6 +393,16 @@ extern "C" REX_FUNC(sub_828FB510) {   // CallFunction(this=r3, FFrame*=r4, Resul
     { PPCContext k = ctx; Bs2ForeignUseAmmo(ctx, base, fw); ctx = k; }
     return;
   }
+  if (Bs2FsActive()) {   // fpswap: anim-name getters get an MP anim back (see Bs2FsAnimResult)
+    const std::string fnm = FnName(ctx, base, ctx.r6.u32);
+    const size_t dot = fnm.find('.');
+    const bool named = fnm.size() > 4 && fnm.compare(fnm.size() - 4, 4, "Anim") == 0;   // name getters only (GetIdlingAnim, GetIdlingHandsAnim...)
+    if (dot != std::string::npos && named && fnm.compare(dot + 1, 3, "Get") == 0 &&
+        (fnm.rfind("Ability.", 0) == 0 || fnm.rfind("PlayerWeapon.", 0) == 0 || fnm.rfind("Weapon.", 0) == 0)) {
+      const uint32_t self = ctx.r3.u32, res = ctx.r5.u32;
+      __imp__sub_828FB510(ctx, base);
+      PPCContext k = ctx; Bs2FsAnimResult(ctx, base, fnm, self, res); ctx = k;
+      return; } }
   if (BRIDGE_DECODE_NAMES && g_n_event.load() > 2000) {
     uint32_t self = ctx.r3.u32, fn = ctx.r6.u32;
     if (!SeenPair(self, fn) && LooksLikeUObject(base, fn)) { PPCContext k = ctx; NoteWeaponFn(ctx, base, self, fn, "calls"); ctx = k; }

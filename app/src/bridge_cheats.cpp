@@ -8,6 +8,11 @@
 // Commands are queued from the UI thread and run on the game thread from the Tick wrapper, through
 // the game's own Exec, with the engine `this` and output device captured from the game's own calls.
 // Backtick console too:  ue god
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <vector>
+#include <string>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
@@ -73,8 +78,13 @@ void RunQueued(PPCContext& ctx, uint8_t* base) {
 }
 }  // namespace
 
+void Bs2SwitchToMultiplayer();   // below: started by bs2start.exe -> hand over to the multiplayer build
 extern "C" REX_FUNC(sub_82478180) {   // engine Exec: capture this / output device / game thread
   static std::unordered_set<std::string> s_seen;
+  // Title screen "Multiplayer": on a console this starts Bioshock2MP_Xenon.xex. Here that is a second program, so when
+  // bs2start.exe started us (BS2START is set) we close with a code it knows and it opens the multiplayer build.
+  static const bool s_starter = std::getenv("BS2START") != nullptr;
+  if (s_starter && ReadGuestW(base, ctx.r4.u32) == "SELECTEDMULTIPLAYERGAME") Bs2SwitchToMultiplayer();
   if (!g_engine.load()) REXLOG_INFO("bioshock2: captured engine Exec this={:08X} ar={:08X} tid={}", ctx.r3.u32, ctx.r5.u32, rex::system::XThread::GetCurrentThreadId());
   g_engine = ctx.r3.u32; g_ar = ctx.r5.u32;
   g_exec_tid = rex::system::XThread::GetCurrentThreadId();
@@ -108,6 +118,15 @@ extern "C" REX_FUNC(sub_8247C7F0) {   // engine Tick: drain the queues on the ga
   if (g_engine.load() && tid == g_exec_tid.load()) {
     auto a = clk::now(); Bs2TickCheats(ctx, base); auto b = clk::now(); Bs2RunGives(ctx, base); auto c = clk::now(); RunQueued(ctx, base); auto d = clk::now();
     Bs2LoaderTick(ctx, base); auto e = clk::now(); Bs2Autotest();
+    { // run\bs2cmd.txt (11-08): remote console commands for the unattended loop - one per line, consumed (renamed) once.
+      // Polled every ~0.5 s. Deletes are blocked in the mount, so the file is renamed to bs2cmd.done (overwritten).
+      static auto lastc = clk::now();
+      if (clk::now() - lastc > std::chrono::milliseconds(500)) { lastc = clk::now();
+        std::error_code ec; if (std::filesystem::exists("run\\bs2cmd.txt", ec)) {
+          std::vector<std::string> cmds; { std::ifstream f("run\\bs2cmd.txt"); std::string l; while (std::getline(f, l)) { while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back(); if (!l.empty()) cmds.push_back(l); } }
+          std::filesystem::rename("run\\bs2cmd.txt", "run\\bs2cmd.done", ec);
+          if (ec) { std::filesystem::remove("run\\bs2cmd.done", ec); std::filesystem::rename("run\\bs2cmd.txt", "run\\bs2cmd.done", ec); }
+          for (auto& c : cmds) { REXLOG_INFO("bioshock2: bs2cmd '{}'", c); Bs2QueueCommand(c); } } } }
     auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
     ours = ms(a, clk::now());
     if (ours > 25) REXLOG_INFO("bioshock2: stutter: our tick {:.1f} ms (cheats {:.1f} gives {:.1f} queue {:.1f} loader {:.1f})", ours, ms(a, b), ms(b, c), ms(c, d), ms(d, e)); }
@@ -129,6 +148,10 @@ extern "C" REX_FUNC(sub_8247C7F0) {   // engine Tick: drain the queues on the ga
 #include <set>
 #include <thread>
 #include <deque>
+void Bs2SwitchToMultiplayer() {
+  REXLOG_INFO("bioshock2: Multiplayer picked on the title screen - closing so bs2start opens the multiplayer build");
+  TerminateProcess(GetCurrentProcess(), 0x4250);   // nothing to save on the title screen; bs2start reads this code
+}
 namespace {
 std::vector<std::string> g_name_hits;
 void ScanNames(std::string needle, size_t cap = 300, bool (*keep)(const std::string&) = nullptr) {
@@ -320,7 +343,9 @@ void Bs2Autotest() {
     for (const char* c : {"allammo", "SwitchToBestWeapon"}) Bs2QueueCommand(c); REXLOG_INFO("bioshock2: autotest: raise - allammo + SwitchToBestWeapon"); } }
   if (state == 3 && test == "mpmodel" && el >= 9 && Bs2Variant("onrivet") && !Bs2Variant("child")) test = "mpmodel-pistol";   // rivet gun only
   if (state == 3 && test == "mpmodel" && el >= 9) {   // BS1 pistol on its own tick (equips; hand attach is parked)
-    Bs2QueueGive("BS1Game.Pistol"); Bs2QueueCommand("GiveWeapon BS1Game.Pistol"); Bs2QueueGive("BS1Game.Pistol_Bullet x6");
+    // nobs1 (11-08 level-change crash bisect): skip the BS1 pistol entirely - MP meshes + puppets only
+    if (Bs2Variant("bs1") && !Bs2Variant("nobs1")) { Bs2QueueGive("BS1Game.Pistol"); Bs2QueueCommand("GiveWeapon BS1Game.Pistol"); Bs2QueueGive("BS1Game.Pistol_Bullet x6"); }
+    else REXLOG_INFO("bioshock2: autotest: BS1 pistol not given (Revolver = MP model on the rivet gun; variant bs1 brings the old one back)");
     test = "mpmodel-pistol";
   }
   if (state == 3 && test == "mpmodel-pistol" && el >= 13) { Bs2RequestMPMesh(); test = "mpmodel-mesh"; }   // load replays the attach

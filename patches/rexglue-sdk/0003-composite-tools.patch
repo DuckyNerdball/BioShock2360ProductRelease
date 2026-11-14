@@ -1,0 +1,144 @@
+Composite tools: sharp_composite_ps, ps_const_log, ps_const_mul, log_quad_draws
+
+- sharp_composite_ps: extra pixel shader hashes that get the bioshock_sharp_composite treatment
+  (BioShock 2 multiplayer's composite is 4B7A33E482E2DF58).
+- ps_const_log / ps_const_mul: log or scale float constants of chosen pixel shaders
+  (multiplayer bloom strength is c1 of that composite).
+- log_quad_draws: diagnostic that lists post-process passes once per pixel shader.
+All off by default.
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -47,6 +47,54 @@
+ REXCVAR_DEFINE_INT32(fetch_1011_exp_adjust_delta, 0, "GPU/D3D12", "Delta added to exp_adjust of wide k_10_11_11 fetches");
+ // bioshock-recomp: in the final composite (PS 32B3EC0C91CA5BCC), bind the full-res scene texture in
+ // place of the 320-wide blurred copy, so the blur blend mixes sharp with sharp.
++// bioshock-recomp: more composite shaders that get the sharp-scene treatment of bioshock_sharp_composite
++// (hex hashes, comma-separated). BioShock 2 multiplayer's composite is 4B7A33E482E2DF58.
++REXCVAR_DEFINE_STRING(sharp_composite_ps, "", "GPU/D3D12",
++                      "Extra pixel shader hashes whose narrow 10_11_11 blur input is replaced by the full-res scene")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// bioshock-recomp: per-shader float constant tools, for tuning a composite without a hash-specific code path.
++//   ps_const_log = HASH[,HASH]              log every float constant those pixel shaders read (a few times each)
++//   ps_const_mul = HASH:index:component:factor[,...]   multiply one component (0-3 = x-w) of constant c<index>
++REXCVAR_DEFINE_STRING(ps_const_log, "", "GPU/D3D12", "Pixel shader hashes whose float constants are logged")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(ps_const_mul, "", "GPU/D3D12", "HASH:index:component:factor list of pixel shader constant multipliers")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++namespace {
++struct BsPsConstMul { uint64_t hash; uint32_t index; uint32_t component; float factor; };
++const std::vector<uint64_t>& BsPsConstLogList() {
++  static const std::vector<uint64_t> v = [] {
++    std::vector<uint64_t> r;
++    std::stringstream ss(REXCVAR_GET(ps_const_log));
++    std::string item;
++    while (std::getline(ss, item, ',')) if (!item.empty()) r.push_back(std::strtoull(item.c_str(), nullptr, 16));
++    return r;
++  }();
++  return v;
++}
++const std::vector<BsPsConstMul>& BsPsConstMulList() {
++  static const std::vector<BsPsConstMul> v = [] {
++    std::vector<BsPsConstMul> r;
++    std::stringstream ss(REXCVAR_GET(ps_const_mul));
++    std::string item;
++    while (std::getline(ss, item, ',')) {
++      std::stringstream is(item);
++      std::string h, idx, comp, fac;
++      if (std::getline(is, h, ':') && std::getline(is, idx, ':') && std::getline(is, comp, ':') &&
++          std::getline(is, fac, ':')) {
++        BsPsConstMul m{std::strtoull(h.c_str(), nullptr, 16), uint32_t(std::strtoul(idx.c_str(), nullptr, 10)),
++                       uint32_t(std::strtoul(comp.c_str(), nullptr, 10)) & 3u, float(std::atof(fac.c_str()))};
++        r.push_back(m);
++        REXGPU_INFO("bioshock-recomp: PS {:016X} c{}[{}] *= {}", m.hash, m.index, m.component, m.factor);
++      }
++    }
++    return r;
++  }();
++  return v;
++}
++}  // namespace
++// bioshock-recomp: diagnostic. Lists each pixel shader that draws a quad (<= 6 vertices: post-process passes, HUD)
++// once, with its target width and the size/format of every texture it samples. Used to find blur/bloom passes.
++REXCVAR_DEFINE_BOOL(log_quad_draws, false, "GPU/D3D12", "Log quad draws once per pixel shader (hash, target, textures)");
+ REXCVAR_DEFINE_BOOL(bioshock_sharp_composite, false, "GPU/D3D12",
+                     "BioShock: feed the sharp scene into the blur slot of the final composite");
+ 
+@@ -2452,8 +2500,22 @@
+       }
+       s_inj_slot = -1;
+     }
++    static const std::vector<uint64_t> s_sharp_ps = [] {
++      std::vector<uint64_t> v{UINT64_C(0x32B3EC0C91CA5BCC)};
++      std::string list = REXCVAR_GET(sharp_composite_ps);
++      size_t pos = 0;
++      while (pos < list.size()) {
++        size_t end = list.find(',', pos);
++        if (end == std::string::npos) end = list.size();
++        std::string item = list.substr(pos, end - pos);
++        if (!item.empty()) v.push_back(std::strtoull(item.c_str(), nullptr, 16));
++        pos = end + 1;
++      }
++      return v;
++    }();
+     if (pixel_shader && REXCVAR_GET(bioshock_sharp_composite) &&
+-        pixel_shader->ucode_data_hash() == UINT64_C(0x32B3EC0C91CA5BCC)) {
++        std::find(s_sharp_ps.begin(), s_sharp_ps.end(), pixel_shader->ucode_data_hash()) !=
++            s_sharp_ps.end()) {
+       auto is_1011 = [](const uint32_t* d) {
+         uint32_t fmt = d[1] & 0x3Fu;
+         return (d[0] & 3u) == 2u && (fmt == 16u || fmt == 55u);
+@@ -2574,6 +2636,28 @@
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+   texture_cache_->RequestTextures(used_texture_mask);
+ 
++  if (pixel_shader && index_count <= 6 && REXCVAR_GET(log_quad_draws)) {
++    static std::vector<uint64_t> s_quad_seen;
++    uint64_t quad_hash = pixel_shader->ucode_data_hash();
++    if (s_quad_seen.size() < 400 &&
++        std::find(s_quad_seen.begin(), s_quad_seen.end(), quad_hash) == s_quad_seen.end()) {
++      s_quad_seen.push_back(quad_hash);
++      std::string quad_tex;
++      const uint32_t* quad_fv = &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
++      uint32_t quad_mask = pixel_shader->GetUsedTextureMaskAfterTranslation();
++      for (uint32_t t = 0; t < 32; ++t) {
++        if (!(quad_mask & (uint32_t(1) << t))) continue;
++        const uint32_t* d = quad_fv + t * 6;
++        quad_tex += " t" + std::to_string(t) + ":" + std::to_string((d[2] & 0x1FFF) + 1) + "x" +
++                    std::to_string(((d[2] >> 13) & 0x1FFF) + 1) + "/f" + std::to_string(d[1] & 0x3F);
++      }
++      REXGPU_INFO("bioshock-recomp: quad draw #{} PS {:016X} ({} dwords) prim {} n {} pitch {}{}",
++                  s_quad_seen.size(), quad_hash, pixel_shader->ucode_dword_count(),
++                  uint32_t(primitive_type), index_count,
++                  uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), quad_tex);
++    }
++  }
++
+   // Bind the pipeline after configuring it and doing everything that may bind
+   // other pipelines.
+   if (current_guest_pipeline_ != pipeline_handle) {
+@@ -4313,6 +4397,23 @@
+               float_constants,
+               &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+               4 * sizeof(float));
++          if (!BsPsConstLogList().empty() || !BsPsConstMulList().empty()) {
++            uint64_t bs_hash = pixel_shader->ucode_data_hash();
++            uint32_t bs_index = (i << 6) + float_constant_index;
++            float* bs_fc = reinterpret_cast<float*>(float_constants);
++            const auto& bs_log = BsPsConstLogList();
++            if (std::find(bs_log.begin(), bs_log.end(), bs_hash) != bs_log.end()) {
++              static int s_bs_logged = 0;
++              if (s_bs_logged < 120) {
++                ++s_bs_logged;
++                REXGPU_INFO("bioshock-recomp: PS {:016X} c{} = {} {} {} {}", bs_hash, bs_index, bs_fc[0],
++                            bs_fc[1], bs_fc[2], bs_fc[3]);
++              }
++            }
++            for (const BsPsConstMul& m : BsPsConstMulList()) {
++              if (m.hash == bs_hash && m.index == bs_index) bs_fc[m.component] *= m.factor;
++            }
++          }
+           if (i == 3 && float_constant_index == 62 &&
+               pixel_shader->ucode_data_hash() == UINT64_C(0x32B3EC0C91CA5BCC)) {
+             float* fc = reinterpret_cast<float*>(float_constants);

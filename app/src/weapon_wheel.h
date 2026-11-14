@@ -87,7 +87,7 @@ class WeaponWheelDialog : public rex::ui::ImGuiDialog {
   }
 
  private:
-  static void Fire(int slot) { if (slot >= 0 && slot < kSlots && Ported(slot)) Bs2WheelRequest(slot); }
+  static void Fire(int slot) { if (slot >= 0 && slot < kSlots) Bs2WheelRequest(slot); }   // unported slots too: the game thread logs them
   static inline std::atomic<bool> kb_open_{false};
   bool was_pad_open_ = false;
   int last_pad_pick_ = -1;

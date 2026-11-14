@@ -1,0 +1,190 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "BioShock 2 (Xbox 360) Recomp",
+  "repo": "DuckyNerdball/BioShock2360ProductRelease",
+  "game": {
+    "kind": "folder",
+    "label": "The folder extracted from your own BioShock 2 (Xbox 360) disc image, the one with Bioshock2_Xenon.xex. To make it: run tools\\extract_disc.ps1 from this project and pick your .iso, or use extract-xiso yourself (extract-xiso -d C:\\Games\\BioShock2-360 BioShock2.iso). Only the build with title ID 54540861 is supported (Bioshock2_Xenon.xex SHA-1 b4196d2bd339ff5e80ee1ce9100cb288bac8a13f).",
+    "check": {
+      "file": "Bioshock2_Xenon.xex"
+    }
+  },
+  "start": {
+    "program": [
+      "bs2start.exe",
+      "app/out/build/win-amd64-relwithdebinfo/bs2start.exe"
+    ],
+    "args": [
+      "--game_data_root",
+      "{game}",
+      "--user_data_root",
+      "{install}/userdata",
+      "--log_file",
+      "{install}/bioshock2.log",
+      "--gpu_plugin",
+      "xenos",
+      "--resolve_1011_exp_bias=0",
+      "--fetch_1011_exp_adjust_delta=-3",
+      "--skip_hdr_1011_resolve_bias=-3",
+      "--bioshock_sharp_composite",
+      "--resolution_scale=2",
+      "--anisotropic_override=5",
+      "--present_cas_additional_sharpness=0.7",
+      "--bioshock_bloom_scale=1.0",
+      "--bioshock_gamma=1.05",
+      "--bioshock_exposure_scale=1.0",
+      "--present_effect=cas",
+      "--swap_post_effect=fxaa",
+      "--present_dither=true",
+      "--texture_cache_memory_limit_soft=2048",
+      "--texture_cache_memory_limit_hard=4096",
+      "--texture_cache_memory_limit_render_to_texture=128",
+      "--draw_resolution_scaled_texture_offsets=false",
+      "--video_mode_refresh_rate=120",
+      "--skip_pixel_shaders=32B3EC0C91CA5BCC",
+      "--direct_host_resolve=true"
+    ]
+  },
+  "saves": [
+    "{install}/userdata"
+  ],
+  "folders": {
+    "saves": [
+      {
+        "path": "{install}/userdata"
+      }
+    ],
+    "logs": [
+      {
+        "path": "{install}"
+      }
+    ]
+  },
+  "settings": [
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "in": "args",
+      "help": "What the game draws at. 720p is the console's own. 4K needs a fast graphics card.",
+      "choices": [
+        {
+          "label": "1440p",
+          "args": []
+        },
+        {
+          "label": "720p",
+          "args": [
+            "--resolution_scale=1"
+          ]
+        },
+        {
+          "label": "4K",
+          "args": [
+            "--resolution_scale=3"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sharpening",
+      "label": "Sharpening",
+      "in": "args",
+      "help": "How the picture is fitted to your screen. CAS keeps edges crisp. Off is the softest.",
+      "choices": [
+        {
+          "label": "CAS",
+          "args": []
+        },
+        {
+          "label": "FSR",
+          "args": [
+            "--present_effect=fsr"
+          ]
+        },
+        {
+          "label": "Off",
+          "args": [
+            "--present_effect=bilinear"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "aa",
+      "label": "Anti-aliasing",
+      "in": "args",
+      "help": "Smooths jagged edges after the frame is drawn. Stronger is a little softer.",
+      "choices": [
+        {
+          "label": "FXAA",
+          "args": []
+        },
+        {
+          "label": "FXAA, stronger",
+          "args": [
+            "--swap_post_effect=fxaa_extreme"
+          ]
+        },
+        {
+          "label": "Off",
+          "args": [
+            "--swap_post_effect=none"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mplook",
+      "label": "Multiplayer picture",
+      "help": "Multiplayer only. Soft glow keeps a little of the game's bloom around lights and fire. Clean removes it for the sharpest image.",
+      "in": "args",
+      "choices": [
+        {
+          "label": "Soft glow",
+          "args": []
+        },
+        {
+          "label": "Clean (no glow)",
+          "args": [
+            "--bs2mplook=clean"
+          ]
+        }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "saves",
+      "label": "Saves",
+      "help": "Your saves and profile.",
+      "open": "saves"
+    },
+    {
+      "id": "logs",
+      "label": "Log",
+      "help": "The log of the last run, for bug reports.",
+      "open": "logs"
+    }
+  ],
+  "games": [
+    {
+      "id": "sp",
+      "name": "BioShock 2",
+      "args": [
+        "--bs2mode=sp"
+      ]
+    },
+    {
+      "id": "mp",
+      "name": "BioShock 2 Multiplayer (offline, vs bots)",
+      "args": [
+        "--bs2mode=mp"
+      ],
+      "saves": [
+        "{install}/mp/run/userdata",
+        "{install}/userdata_mp"
+      ]
+    }
+  ]
+}

@@ -134,7 +134,7 @@ $btnMp.Add_Click({
         return
     }
     $a = (Get-PlayArgs) -replace '^-Project bioshock2 ', '-Project bioshock2mp '
-    Start-Console "& '.\mp\tools\play.ps1' $a -Extra '--fake_live_signin=true'"
+    Start-Console "& '.\mp\tools\play.ps1' $a -Extra '--fake_live_signin=true','--ps_const_mul=4B7A33E482E2DF58:1:0:0.125,4B7A33E482E2DF58:1:1:0.125,4B7A33E482E2DF58:1:2:0.125,4B7A33E482E2DF58:4:0:0,4B7A33E482E2DF58:4:1:0,4B7A33E482E2DF58:4:2:0'"
 })
 $cbBots.Add_SelectedIndexChanged({ Save-Settings; Set-BotIni }); $chkHunt.Add_CheckedChanged({ Save-Settings; Set-BotIni })   # live: the game re-reads it every 2 s
 $cbBots.BackColor = [Drawing.Color]::FromArgb(30, 44, 38); $cbBots.ForeColor = $form.ForeColor
