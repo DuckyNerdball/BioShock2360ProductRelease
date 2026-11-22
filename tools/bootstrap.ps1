@@ -17,7 +17,8 @@ One-shot environment setup for the BioShock 360 recomp. Safe to re-run: every st
   Manual steps that can't be scripted: extracting content packages in Velocity (GUI).
 #>
 param(
-    [string]$ToolsDir = "E:\Tools",
+    # E:\Tools on the dev box; everyone else gets <repo>\.tools (no E: drive assumed - RecompLauncher report 11-19)
+    [string]$ToolsDir = $(if (Test-Path "E:\Tools") { "E:\Tools" } else { Join-Path (Split-Path -Parent $PSScriptRoot) ".tools" }),
     [string]$IsoDir   = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
     [int]$MinFreeGB   = 50,
     [switch]$SkipVS, [switch]$SkipGhidra, [switch]$SkipXenia, [switch]$SkipDiscs, [switch]$SkipSetup

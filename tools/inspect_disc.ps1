@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory)][string]$Iso,
     [Parameter(Mandatory)][string]$Name,
-    [string]$ExtractXiso = "E:\Tools\artifacts\extract-xiso.exe",
+    [string]$ExtractXiso = $(if (Test-Path "E:\Tools") { "E:\Tools\artifacts\extract-xiso.exe" } else { Join-Path (Split-Path -Parent $PSScriptRoot) ".tools\artifacts\extract-xiso.exe" }),
     [switch]$SkipExtract
 )
 $ErrorActionPreference = "Stop"
