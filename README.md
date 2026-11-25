@@ -38,6 +38,11 @@ What the PC versions still do better: higher-resolution textures, native mouse a
 This is the Xbox 360 game running natively, not a replacement for the PC release.
 
 ## Install (Windows 10/11 x64, ~60 GB free, 1-2 hours the first time)
+**Easiest: RecompLauncher.** Install BioShock 2 Recomp there, pick your `.iso`, tick the Visual Studio licence if this
+PC doesn't have Visual Studio C++, and press Set Up. Approve the one administrator prompt; it installs the build tools,
+extracts your disc and builds single player and multiplayer (1-2 hours the first time), then shows Play.
+
+**Or by hand:**
 1. Download the latest release zip and extract it to a short path (e.g. `C:\Games\bioshock2-recomp`).
 2. Right-click `Install.ps1` > **Run with PowerShell** and pick your disc image (.iso).
    It installs the build tools, extracts your disc, checks the exact build, builds single player and
@@ -67,22 +72,14 @@ multiplayer (private matches against AI bots; it never connects to Xbox Live) ar
 the title screen to switch to the multiplayer build, and **Single Player Game** there to switch back. Both start through
 `bs2start.exe`, a small starter built with the game that runs the right program.
 
-This project publishes no built game, so RecompLauncher cannot download one. After `Install.ps1` has built your copy:
-
-1. Run `tools\package_local.ps1`. It makes `out\recomplauncher` (run it again after every rebuild).
-2. In RecompLauncher: Settings > Developers > Developer tools > "Add a build" > pick `out\recomplauncher`.
-3. When it asks for your copy of the game, pick your game folder (`game_bs2`). Do not add `game_bs2` as the build.
+The release zip holds only this project's code and scripts. RecompLauncher asks for your `.iso` and runs `Prepare.cmd`
+once (= `Install.ps1 -Launcher`: no questions, one administrator prompt, progress shown in the launcher). It builds both
+games into the install folder, keeps the extracted disc there as `game_bs2`, and does not need the `.iso` again.
+Setup exit codes: 2 no disc image, 3 Visual Studio licence not ticked, 4 build failed (log in `logs\install_*.log`),
+5 not the supported disc, 6 administrator prompt declined.
 
 Multiplayer picture: **Soft glow** keeps the game's bloom at 5% of its original strength; **Clean** removes it. The
 original strength hazes the whole screen at 2x resolution.
-
-RecompLauncher asks for your copy as a **game folder**: the files extracted from your disc image, with
-`Bioshock2_Xenon.xex` at the top. `Install.ps1` already makes it as `game_bs2`. On its own:
-
-```powershell
-.\tools\extract_disc.ps1                                                # asks for the .iso, extracts to .\game_bs2
-.\tools\extract_disc.ps1 -Iso D:\BioShock2.iso -Out D:\Games\BioShock2-360
-```
 
 ## Never share
 Your built `bioshock2.exe` / `bioshock2mp.exe`, `app/generated/`, `mp/app/generated/`, or anything from `game_bs2\`.

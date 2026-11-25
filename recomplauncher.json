@@ -3,21 +3,32 @@
   "format": 1,
   "name": "BioShock 2 (Xbox 360) Recomp",
   "repo": "DuckyNerdball/BioShock2360ProductRelease",
-  "game": {
-    "kind": "folder",
-    "label": "The folder extracted from your own BioShock 2 (Xbox 360) disc image, the one with Bioshock2_Xenon.xex. To make it: run tools\\extract_disc.ps1 from this project and pick your .iso, or use extract-xiso yourself (extract-xiso -d C:\\Games\\BioShock2-360 BioShock2.iso). Only the build with title ID 54540861 is supported (Bioshock2_Xenon.xex SHA-1 b4196d2bd339ff5e80ee1ce9100cb288bac8a13f).",
-    "check": {
-      "file": "Bioshock2_Xenon.xex"
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your own BioShock 2 (Xbox 360) disc image (.iso). Setup extracts it, checks it is the supported build (title ID 54540861, Bioshock2_Xenon.xex SHA-1 b4196d2bd339ff5e80ee1ce9100cb288bac8a13f) and builds single player and the offline multiplayer from it on this PC. It does not need the .iso again afterwards.",
+      "formats": [
+        {
+          "type": "file",
+          "extensions": [
+            "iso"
+          ]
+        }
+      ],
+      "check": {
+        "xdvdfs": "Bioshock2_Xenon.xex"
+      }
     }
-  },
+  ],
   "start": {
     "program": [
+      "app/out/build/win-amd64-relwithdebinfo/bs2start.exe",
       "bs2start.exe",
-      "app/out/build/win-amd64-relwithdebinfo/bs2start.exe"
+      "BioShock2.cmd"
     ],
     "args": [
       "--game_data_root",
-      "{game}",
+      "{install}/game_bs2",
       "--user_data_root",
       "{install}/userdata",
       "--log_file",
@@ -46,10 +57,48 @@
       "--direct_host_resolve=true"
     ]
   },
+  "prepare": {
+    "program": [
+      "Prepare.cmd"
+    ],
+    "label": "Builds the game from your disc: installs the build tools, extracts your .iso and compiles single player and multiplayer (1-2 hours the first time; asks for administrator approval once)",
+    "env": {
+      "BS_ISO": "{input:game}"
+    },
+    "keeps_copy": true,
+    "done": [
+      "{install}/game_bs2/Bioshock2_Xenon.xex",
+      "{install}/app/out/build/win-amd64-relwithdebinfo/bioshock2.exe",
+      "{install}/app/out/build/win-amd64-relwithdebinfo/bs2start.exe"
+    ],
+    "options": [
+      {
+        "id": "vs",
+        "label": "Install Visual Studio 2022 Community (C++ and Clang) if this PC does not have it",
+        "note": "Needed to compile the game. Skipped when Visual Studio C++ is already installed.",
+        "os": [
+          "windows"
+        ],
+        "license": {
+          "name": "Visual Studio 2022 Community",
+          "url": "https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/"
+        },
+        "args": [
+          "-AcceptVsLicense"
+        ],
+        "required": false
+      }
+    ]
+  },
   "saves": [
     "{install}/userdata"
   ],
   "folders": {
+    "game": [
+      {
+        "path": "{install}/game_bs2"
+      }
+    ],
     "saves": [
       {
         "path": "{install}/userdata"
